@@ -1,2 +1,10 @@
+# 忽略 CAIL2018 训练数据
+data/FT_data/cail_2018/train.json
+data/FT_data/template/Trainingdata.jsonl
+
+# （如果有整个切分目录，也要一起忽略）
+data/FT_data/cail_2018/ft_splits/ 
+
+# 忽略测试集数据
 data/testset/test.json
 data/testset/testset.json

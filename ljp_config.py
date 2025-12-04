@@ -15,7 +15,10 @@ EMBEDDING_API_KEY = "sk-d103be2645ca438d91892867a65cfd2c"
 # LLM for the agents (can still be overridden via CLI)
 # LLM候选
 # LLM_MODEL = "qwen3-max"
-LLM_MODEL = "qwen3-32b"
+# LLM_MODEL = "qwen3-32b"
+LLM_MODEL = "qwen3-8b"
+# 微调模型
+# LLM_MODEL = "qwen3-32b-ft-202512041704-057e"
 LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 LLM_API_KEY = "sk-d103be2645ca438d91892867a65cfd2c"
 
