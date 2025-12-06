@@ -34,8 +34,25 @@ from ljp_workflow import build_resources, predict_case
 # ------------------------ Data loading --------------------------- #
 def iter_testset(path: Path, offset: int = 0, limit: Optional[int] = None):
     """
-    Iterate over CAIL2018 testset (test.json). File is JSONL.
+    Iterate over CAIL2018 testset. Supports JSONL and JSON list.
     """
+    text = path.read_text(encoding="utf-8", errors="ignore").strip()
+    # Try full JSON (list) first
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            for idx, obj in enumerate(data):
+                if idx < offset:
+                    continue
+                if limit is not None and idx >= offset + limit:
+                    return
+                if isinstance(obj, dict):
+                    yield obj
+            return
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback to JSONL
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for idx, line in enumerate(f):
             if idx < offset:
@@ -53,6 +70,14 @@ def iter_testset(path: Path, offset: int = 0, limit: Optional[int] = None):
 
 
 def count_testset(path: Path) -> Optional[int]:
+    text = path.read_text(encoding="utf-8", errors="ignore").strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return len(data)
+    except json.JSONDecodeError:
+        pass
+
     total = 0
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -118,6 +143,12 @@ def main():
     parser.add_argument("--limit", type=int, default=5, help="Number of cases to evaluate")
     parser.add_argument("--offset", type=int, default=0, help="Start from this index")
     parser.add_argument("--top-k", type=int, default=None, help="Override top-k for retrieval")
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default="data/testset/test.json",
+        help="Path to CAIL2018 test JSONL (default: data/testset/test.json)",
+    )
     parser.add_argument("--output-dir", type=str, default="output_cail2018", help="Directory to save results")
     args = parser.parse_args()
 
@@ -132,7 +163,7 @@ def main():
     if args.top_k is not None:
         pipe_args.top_k = args.top_k
 
-    test_path = Path("data/testset/test.json")
+    test_path = Path(args.dataset_path)
     total_raw = count_testset(test_path) or 0
     if total_raw and args.limit is not None:
         total_eval = max(0, min(args.limit, total_raw - args.offset))
