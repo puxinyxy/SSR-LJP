@@ -191,3 +191,51 @@ def penalty_stats(cases: Sequence[TextItem]) -> str:
         flags.append(f"死刑:{death_count}")
     flag_txt = f"（{', '.join(flags)}）" if flags else ""
     return f"刑期统计: {imp_summary}{flag_txt}"
+
+
+def penalty_stats_structured(records: Sequence[dict]) -> str:
+    """
+    Summarize imprisonment months from structured precedent outputs.
+    Accepts a list of dicts containing sentence_months and penalty_factors.
+    """
+    imprison_months: list[float] = []
+    life_count = 0
+    death_count = 0
+    suspended_count = 0
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        months = rec.get("sentence_months")
+        if isinstance(months, str):
+            try:
+                months = float(months.strip())
+            except (TypeError, ValueError):
+                months = None
+        factors = rec.get("penalty_factors") if isinstance(rec.get("penalty_factors"), dict) else {}
+        if months == -1:
+            life_count += 1
+            continue
+        if months == -2:
+            death_count += 1
+            continue
+        if isinstance(months, (int, float)):
+            imprison_months.append(float(months))
+        if isinstance(factors, dict) and factors.get("suspended") is True:
+            suspended_count += 1
+
+    def summarize(nums: list[float]) -> str:
+        if not nums:
+            return "无数据"
+        avg = sum(nums) / len(nums)
+        return f"均值≈{avg:.1f}，最小={min(nums):.0f}，最大={max(nums):.0f}"
+
+    imp_summary = summarize(imprison_months)
+    flags = []
+    if life_count:
+        flags.append(f"无期:{life_count}")
+    if death_count:
+        flags.append(f"死刑:{death_count}")
+    if suspended_count:
+        flags.append(f"缓刑:{suspended_count}")
+    flag_txt = f"（{', '.join(flags)}）" if flags else ""
+    return f"刑期统计: {imp_summary}{flag_txt}"

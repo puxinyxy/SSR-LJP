@@ -11,4 +11,5 @@ data/testset/testset.json
 
 # 忽略执行结果
 output_cail2018/
+output/
 baseline_output/

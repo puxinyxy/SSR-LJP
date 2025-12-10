@@ -4,6 +4,7 @@ Orchestrates the LJP multi-agent workflow.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
@@ -34,6 +35,7 @@ from ljp_tools import (
     load_law_articles,
     load_test_case,
     penalty_stats,
+    penalty_stats_structured,
     search_index,
     TextItem,
 )
@@ -116,7 +118,6 @@ def predict_case(case_fact: str, resources: PipelineResources, top_k: int):
         + ", ".join(prelim_acc)
     )
     cand_hits = search_index(resources.cand_index, cand_query, top_k)
-    penalty_summary = penalty_stats(cand_hits)
 
     # Agents
     agents = resources.agents
@@ -133,14 +134,33 @@ def predict_case(case_fact: str, resources: PipelineResources, top_k: int):
         f"案件事实：{case_fact}\n"
         f"候选罪名示例：\n" + "\n".join(f"- {h.text}" for h in acc_hits)
     )
+
+    def _format_term(meta: dict) -> str:
+        term = meta.get("term_of_imprisonment", {}) if isinstance(meta, dict) else {}
+        if term.get("death_penalty"):
+            return "死刑"
+        if term.get("life_imprisonment"):
+            return "无期"
+        imp = term.get("imprisonment")
+        if isinstance(imp, (int, float)):
+            return f"{imp}个月"
+        return "未知"
+
+    cand_blocks = []
+    for h in cand_hits:
+        meta = h.meta or {}
+        block = (
+            f"- case_id={meta.get('case_id')} | 罪名={meta.get('accusation')} | "
+            f"法条={meta.get('relevant_articles')} | 量刑信息={_format_term(meta)}\n"
+            f"  案例原文/摘要：{h.text.strip()[:800]}"
+        )
+        cand_blocks.append(block)
     prec_prompt = (
         f"案件事实：{case_fact}\n"
         f"预测法条：{prelim_laws}\n"
         f"预测罪名：{prelim_acc}\n"
-        f"候选案例（只显示前 {top_k} 个，含 case_id）：\n"
-        + "\n".join(
-            f"[case_id={h.meta.get('case_id')}] {h.text[:200]}..." for h in cand_hits
-        )
+        f"候选案例（逐条抽取量刑因子并按 JSON 数组输出，仅输出 JSON）：\n"
+        + "\n\n".join(cand_blocks)
     )
 
     law_step = law_agent.step(law_prompt)
@@ -154,11 +174,40 @@ def predict_case(case_fact: str, resources: PipelineResources, top_k: int):
     acc_resp = acc_step.msgs[0].content
     prec_resp = prec_step.msgs[0].content
 
+    prec_structured: List[Dict[str, Any]] = []
+    if prec_resp:
+        try:
+            parsed = json.loads(prec_resp)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if isinstance(parsed, list):
+            prec_structured = [p for p in parsed if isinstance(p, dict)]
+        if not prec_structured:
+            try:
+                start = prec_resp.find("[")
+                end = prec_resp.rfind("]")
+                if start != -1 and end != -1 and end > start:
+                    parsed = json.loads(prec_resp[start : end + 1])
+                    if isinstance(parsed, dict):
+                        parsed = [parsed]
+                    if isinstance(parsed, list):
+                        prec_structured = [p for p in parsed if isinstance(p, dict)]
+            except Exception:
+                prec_structured = []
+
+    penalty_summary = (
+        penalty_stats_structured(prec_structured) if prec_structured else penalty_stats(cand_hits)
+    )
+    prec_structured_text = json.dumps(prec_structured, ensure_ascii=False) if prec_structured else "[]"
+
     judge_prompt = (
         f"案件事实：{case_fact}\n"
         f"法条预测：{law_resp}\n"
         f"罪名预测：{acc_resp}\n"
-        f"相似案例摘要：{prec_resp}\n"
+        f"相似案例结构化量刑因子（JSON 数组）：{prec_structured_text}\n"
+        f"相似案例原始摘要/回退：{prec_resp}\n"
         f"相似案例量化统计（供量刑参考）：{penalty_summary}"
     )
     judge_step = judge_agent.step(judge_prompt)
@@ -170,6 +219,7 @@ def predict_case(case_fact: str, resources: PipelineResources, top_k: int):
         "law_resp": law_resp,
         "acc_resp": acc_resp,
         "prec_resp": prec_resp,
+        "prec_structured": prec_structured,
         "judgment": judgment,
         "law_hits": law_hits,
         "acc_hits": acc_hits,

@@ -21,6 +21,28 @@ from typing import Dict, Iterable, Optional, Set, Tuple
 
 import json as _json_for_excel
 
+# Compatibility shim: openai<1.44 lacks ParsedChatCompletion.
+try:  # pragma: no cover - best-effort guard for old SDK
+    from openai.types.chat import ParsedChatCompletion as _ParsedChatCompletion  # type: ignore
+except Exception:  # noqa: BLE001
+    import sys
+    import types
+
+    try:
+        import openai  # type: ignore
+    except Exception:  # noqa: BLE001
+        openai = None  # type: ignore
+
+    chat_mod = sys.modules.get("openai.types.chat")
+    if chat_mod is None:
+        chat_mod = types.ModuleType("openai.types.chat")
+        sys.modules["openai.types.chat"] = chat_mod
+    if not hasattr(chat_mod, "ParsedChatCompletion"):
+        class ParsedChatCompletion:  # Minimal placeholder for older SDKs
+            ...
+
+        chat_mod.ParsedChatCompletion = ParsedChatCompletion  # type: ignore
+
 
 def _cell_safe(val):
     """Convert lists/dicts to JSON strings for Excel cells."""
