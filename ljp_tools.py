@@ -239,3 +239,64 @@ def penalty_stats_structured(records: Sequence[dict]) -> str:
         flags.append(f"缓刑:{suspended_count}")
     flag_txt = f"（{', '.join(flags)}）" if flags else ""
     return f"刑期统计: {imp_summary}{flag_txt}"
+
+
+# ------------------------ Optional compression (LLMLingua-2) ------------------------ #
+_LLM2_COMPRESSOR = None
+
+
+def lingua_compress(
+    text: str,
+    rate: float = 0.5,
+    min_chars: int = 300,
+    token_limit: int = 16000,
+    approx_chars_per_token: float = 2.0,
+    force_tokens: list[str] | None = None,
+) -> str:
+    """
+    Use LLMLingua-2 PromptCompressor to compress text to a given rate.
+    - Only compress when len(text) >= min_chars AND estimated tokens exceed token_limit
+    - On any exception or empty result, fall back to original text
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if len(text) < min_chars:
+        return text
+    try:
+        est_tokens = len(text) / max(approx_chars_per_token, 0.5)
+        if est_tokens <= token_limit:
+            return text
+    except Exception:
+        pass
+
+    try:
+        from llmlingua import PromptCompressor  # type: ignore
+        import torch
+    except Exception:
+        return text
+
+    global _LLM2_COMPRESSOR
+    if _LLM2_COMPRESSOR is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            _LLM2_COMPRESSOR = PromptCompressor(
+                model_name="microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank",
+                use_llmlingua2=True,
+                device_map=device,
+            )
+        except Exception:
+            return text
+
+    separators = force_tokens or ["\n", "。", "？", "！", "："]
+    try:
+        result = _LLM2_COMPRESSOR.compress_prompt(
+            text,
+            rate=rate,
+            force_tokens=separators,
+        )
+        compressed = result.get("compressed_prompt") if isinstance(result, dict) else None
+        if compressed:
+            return compressed
+    except Exception:
+        return text
+    return text

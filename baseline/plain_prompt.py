@@ -41,11 +41,11 @@ from ljp_eval import count_testset as count_testset_cjo
 
 # ------------------------ Config (editable) ------------------------ #
 # DEFAULT_MODEL = "qwen3-235b-a22b"
-DEFAULT_MODEL = "qwen3-max"
-# DEFAULT_MODEL = "qwen3-8b"
+# DEFAULT_MODEL = "qwen3-max"
+DEFAULT_MODEL = "qwen3-8b"
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_API_KEY = "sk-d103be2645ca438d91892867a65cfd2c"
-DEFAULT_DATASET_CAIL = "data/testset/test.json"  # CAIL2018-format testset
+DEFAULT_DATASET_CAIL = "data/testset/cail_sampled.json"  # CAIL2018-format testset
 DEFAULT_DATASET_CJO22 = "data/testset/testset.json"  # cjo22-format testset
 DEFAULT_OUTPUT_DIR_CAIL = "baseline_output/plain_prompt_cail2018"
 DEFAULT_OUTPUT_DIR_CJO22 = "baseline_output/plain_prompt_cjo22"

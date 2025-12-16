@@ -36,6 +36,7 @@ from ljp_tools import (
     load_test_case,
     penalty_stats,
     penalty_stats_structured,
+    lingua_compress,
     search_index,
     TextItem,
 )
@@ -104,6 +105,14 @@ def build_resources(args) -> PipelineResources:
 
 def predict_case(case_fact: str, resources: PipelineResources, top_k: int):
     """Predict law, accusation, similar cases, and judgment."""
+    # Reset agent memories to avoid cross-case accumulation
+    for ag_key in ("law", "acc", "prec", "judge"):
+        if hasattr(resources.agents.get(ag_key), "reset"):
+            try:
+                resources.agents[ag_key].reset()
+            except Exception:
+                pass
+
     # Retrieve candidates
     law_hits = search_index(resources.law_index, case_fact, top_k)
     acc_hits = search_index(resources.acc_index, case_fact, top_k)
@@ -149,10 +158,14 @@ def predict_case(case_fact: str, resources: PipelineResources, top_k: int):
     cand_blocks = []
     for h in cand_hits:
         meta = h.meta or {}
+        raw_text = h.text.strip()
+        compressed_text = lingua_compress(raw_text, rate=0.5, min_chars=400, token_limit=16000)
+        if not compressed_text:
+            compressed_text = raw_text
         block = (
             f"- case_id={meta.get('case_id')} | 罪名={meta.get('accusation')} | "
             f"法条={meta.get('relevant_articles')} | 量刑信息={_format_term(meta)}\n"
-            f"  案例原文/摘要：{h.text.strip()[:800]}"
+            f"  案例原文/摘要：{compressed_text}"
         )
         cand_blocks.append(block)
     prec_prompt = (
