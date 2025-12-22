@@ -54,14 +54,18 @@ class PipelineResources:
     agents: Dict[str, Any]
 
 
-def build_resources(args) -> PipelineResources:
+def build_resources(args, candidates_path: Path | None = None) -> PipelineResources:
     data_dir = Path("data")
     law_dir = data_dir / "law_articles"
     law_path_candidates = list(law_dir.glob("*.txt"))
     if not law_path_candidates:
         raise FileNotFoundError(f"No law article .txt found in {law_dir}")
     law_path = law_path_candidates[0]
-    candidates_path = data_dir / "candidates" / "precedent_case.json"
+    if candidates_path is None:
+        if getattr(args, "candidates_path", None):
+            candidates_path = Path(args.candidates_path)
+        else:
+            candidates_path = data_dir / "candidates" / "precedent_case.json"
 
     # Load data
     law_items = load_law_articles(law_path, max_chunks=args.max_law_chunks)

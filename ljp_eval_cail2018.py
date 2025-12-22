@@ -127,8 +127,8 @@ def evaluate_case(pred: Dict[str, str], truth: Dict) -> Dict[str, Optional[float
     pred_cls = get_pt_cls(pred_imp) if isinstance(pred_imp, (int, float)) else None
 
     metrics: Dict[str, Optional[float]] = {}
-    metrics["law_acc"] = (len(truth_laws & pred_laws) / len(truth_laws)) if truth_laws else None
-    metrics["acc_acc"] = (len(truth_accs & pred_accs) / len(truth_accs)) if truth_accs else None
+    metrics["law_acc"] = None if not truth_laws else (1.0 if pred_laws == truth_laws else 0.0)
+    metrics["acc_acc"] = None if not truth_accs else (1.0 if pred_accs == truth_accs else 0.0)
     if truth_cls is None and pred_cls is None:
         metrics["penalty_cls_acc"] = None
     elif truth_cls is not None and pred_cls is not None:
@@ -150,6 +150,12 @@ def main():
         help="Path to CAIL2018 test JSONL (default: data/testset/cail_sampled.json)",
     )
     parser.add_argument("--output-dir", type=str, default="output_cail2018", help="Directory to save results")
+    parser.add_argument(
+        "--candidates-path",
+        type=str,
+        default=None,
+        help="Precedent candidates path (default: data/candidates/precedents_cail.json)",
+    )
     args = parser.parse_args()
 
     from ljp_multi_agent import parse_args as pipeline_args
@@ -162,6 +168,8 @@ def main():
     sys.argv = _argv_backup
     if args.top_k is not None:
         pipe_args.top_k = args.top_k
+    # Use CAIL-specific candidates file; allow override via CLI
+    pipe_args.candidates_path = args.candidates_path or "data/candidates/precedents_cail.json"
 
     test_path = Path(args.dataset_path)
     total_raw = count_testset(test_path) or 0

@@ -41,8 +41,8 @@ from ljp_eval import count_testset as count_testset_cjo
 
 # ------------------------ Config (editable) ------------------------ #
 # DEFAULT_MODEL = "qwen3-235b-a22b"
-# DEFAULT_MODEL = "qwen3-max"
-DEFAULT_MODEL = "qwen3-8b"
+DEFAULT_MODEL = "qwen3-max"
+# DEFAULT_MODEL = "qwen3-8b"
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_API_KEY = "sk-d103be2645ca438d91892867a65cfd2c"
 DEFAULT_DATASET_CAIL = "data/testset/cail_sampled.json"  # CAIL2018-format testset
@@ -69,7 +69,7 @@ PROMPTS = {
         "务必返回合法 JSON。"
     ),
     "LOT_prompt": (
-        "你在司法三段论中，大前提是具体的法律规范，小前提是案件事实，结论是判决结果。 \n"
+        "在司法三段论中，大前提是具体的法律规范，小前提是案件事实，结论是判决结果。 \n"
         "让我们用司法三段论思考，输出被告人构成的法条、罪名、刑期，最后输出被告人构成的罪名最终只输出一个合法的 JSON 对象，不能有多余文字。\n"
         "JSON 字段必须且仅有 3 个：\n"
         '  1) \"articles\": 法条编号整数列表，例如 [263, 264]\n'
@@ -103,8 +103,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--limit", type=int, default=1698)
     parser.add_argument("--offset", type=int, default=0)
-    parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--max-tokens", type=int, default=8000)
+    parser.add_argument("--temperature", type=float, default=0)
+    parser.add_argument("--max-tokens", type=int, default=16000)
     return parser.parse_args()
 
 

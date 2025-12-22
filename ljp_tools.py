@@ -51,11 +51,46 @@ def load_law_articles(path: Path, max_chunks: int) -> List[TextItem]:
 
 def load_candidates(path: Path, max_items: int) -> List[TextItem]:
     items: List[TextItem] = []
+    text = path.read_text(encoding="utf-8", errors="ignore").strip()
+    # Detect JSON array vs JSONL
+    if text.startswith("["):
+        try:
+            data = json.loads(text)
+            iterable = data if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            iterable = []
+        for i, obj in enumerate(iterable):
+            if i >= max_items:
+                break
+            if not isinstance(obj, dict):
+                continue
+            fact = obj.get("fact", "")
+            meta = obj.get("meta", {})
+            items.append(
+                TextItem(
+                    text=fact,
+                    meta={
+                        "case_id": obj.get("caseID", i),
+                        "accusation": meta.get("accusation", []),
+                        "relevant_articles": meta.get("relevant_articles", []),
+                        "term_of_imprisonment": meta.get("term_of_imprisonment", {}),
+                        "punish_of_money": meta.get("punish_of_money", 0),
+                    },
+                )
+            )
+        return items
+
     with path.open("r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             if i >= max_items:
                 break
-            obj = json.loads(line)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             fact = obj.get("fact", "")
             meta = obj.get("meta", {})
             items.append(

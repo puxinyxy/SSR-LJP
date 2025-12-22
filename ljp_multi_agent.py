@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
         default=LLM_BASE_URL,
         help="LLM base URL (OpenAI compatible).",
     )
+    parser.add_argument(
+        "--candidates-path",
+        type=str,
+        default=None,
+        help="Path to precedent candidates JSONL (defaults to data/candidates/precedent_case.json for cjo, precedents_cail.json can be used for cail).",
+    )
     return parser.parse_args()
 
 
