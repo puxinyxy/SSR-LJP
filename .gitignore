@@ -13,3 +13,6 @@ data/testset/testset.json
 output_cail2018/
 output/
 baseline_output/
+
+# 忽略embedding执行结果
+embedding_output/

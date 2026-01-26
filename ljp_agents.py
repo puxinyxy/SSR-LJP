@@ -96,7 +96,7 @@ def make_llm(model_name: str, api_key: str, base_url: str):
         url=base_url,
         # 明确关闭 Qwen 的 thinking 模式（非流式必须 enable_thinking=False），其余配置保持不变
         # 8b生成上限8k
-        model_config_dict={"max_tokens": 16000, "extra_body": {"enable_thinking": False}},
+        model_config_dict={"max_tokens": 8000, "extra_body": {"enable_thinking": False}},
     )
 
 
