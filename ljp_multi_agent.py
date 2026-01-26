@@ -5,6 +5,9 @@ Entry point for the LJP multi-agent demo.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+
+from logger_utils import setup_run_logger
 from ljp_config import (
     EMBED_BATCH,
     LLM_API_KEY,
@@ -54,4 +57,16 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    logger, run_dir, run_id = setup_run_logger(
+        run_name="ljp_multi_agent",
+        args=vars(args),
+        extra={"cwd": str(Path.cwd())},
+    )
+    logger.info(
+        "config case_id=%s top_k=%s max_law_chunks=%s max_candidates=%s",
+        args.case_id,
+        args.top_k,
+        args.max_law_chunks,
+        args.max_candidates,
+    )
     run_pipeline(args)

@@ -20,6 +20,7 @@ from statistics import mean
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 import json as _json_for_excel
+from logger_utils import log_metrics, setup_run_logger
 
 # Compatibility shim: openai<1.44 lacks ParsedChatCompletion.
 try:  # pragma: no cover - best-effort guard for old SDK
@@ -351,6 +352,12 @@ def main():
     parser.add_argument("--output-dir", type=str, default="output", help="Directory to save results")
     args = parser.parse_args()
 
+    logger, run_dir, run_id = setup_run_logger(
+        run_name="ljp_eval",
+        args=vars(args),
+        extra={"cwd": str(Path.cwd())},
+    )
+
     from openai import BadRequestError
     from camel.models.model_manager import ModelProcessingError
     from openpyxl import Workbook
@@ -375,7 +382,15 @@ def main():
     else:
         total_eval = args.limit or 0
 
+    logger.info(
+        "config test_path=%s total_raw=%s total_eval=%s",
+        str(test_path),
+        total_raw,
+        total_eval,
+    )
+
     resources = build_resources(pipe_args)
+    logger.info("resources_built top_k=%s", pipe_args.top_k)
 
     all_metrics = {
         "law_recall": [],
@@ -431,13 +446,28 @@ def main():
             if "data_inspection_failed" in full_msg or "inappropriate content" in full_msg:
                 skipped.append(case_obj.get("caseID"))
                 print(f"Skip CaseID={case_obj.get('caseID')} due to content inspection", flush=True)
+                logger.warning(
+                    "case_skipped caseID=%s reason=content_inspection err_type=%s err=%s",
+                    case_obj.get("caseID"),
+                    type(e).__name__,
+                    full_msg,
+                )
+                logger.info("case_skipped caseID=%s reason=content_inspection", case_obj.get("caseID"))
                 continue
             if isinstance(e, (ModelProcessingError, ValueError)):
                 skipped.append(case_obj.get("caseID"))
                 print(f"Skip CaseID={case_obj.get('caseID')} due to model processing error", flush=True)
+                logger.exception(
+                    "case_error caseID=%s reason=model_processing err_type=%s err=%s",
+                    case_obj.get("caseID"),
+                    type(e).__name__,
+                    full_msg,
+                )
+                logger.info("case_skipped caseID=%s reason=model_processing", case_obj.get("caseID"))
                 continue
             raise
         m = evaluate_case(pred, case_obj)
+        logger.info("case_done caseID=%s metrics=%s", case_obj.get("caseID"), m)
         for k, v in m.items():
             if v is not None:
                 all_metrics[k].append(v)
@@ -492,6 +522,7 @@ def main():
         print(f"Skipped (content inspection/model errors): {len(skipped)} -> {skipped[:10]}{'...' if len(skipped)>10 else ''}")
     for k, v in summary.items():
         print(f"{k}: {v}")
+    log_metrics(logger, summary, prefix="summary")
 
     ws_summary = wb.create_sheet("summary")
     ws_summary.append(["metric", "value"])

@@ -36,7 +36,6 @@ from ljp_tools import (
     load_test_case,
     penalty_stats,
     penalty_stats_structured,
-    lingua_compress,
     search_index,
     TextItem,
 )
@@ -56,11 +55,9 @@ class PipelineResources:
 
 def build_resources(args, candidates_path: Path | None = None) -> PipelineResources:
     data_dir = Path("data")
-    law_dir = data_dir / "law_articles"
-    law_path_candidates = list(law_dir.glob("*.txt"))
-    if not law_path_candidates:
-        raise FileNotFoundError(f"No law article .txt found in {law_dir}")
-    law_path = law_path_candidates[0]
+    law_path = Path(r"G:\\graduate_1\\Code\\Camel\\data\\meta\\laws.txt")
+    if not law_path.exists():
+        raise FileNotFoundError(f"Law articles file not found: {law_path}")
     if candidates_path is None:
         if getattr(args, "candidates_path", None):
             candidates_path = Path(args.candidates_path)
@@ -163,9 +160,7 @@ def predict_case(case_fact: str, resources: PipelineResources, top_k: int):
     for h in cand_hits:
         meta = h.meta or {}
         raw_text = h.text.strip()
-        compressed_text = lingua_compress(raw_text, rate=0.5, min_chars=400, token_limit=16000)
-        if not compressed_text:
-            compressed_text = raw_text
+        compressed_text = raw_text
         block = (
             f"- case_id={meta.get('case_id')} | 罪名={meta.get('accusation')} | "
             f"法条={meta.get('relevant_articles')} | 量刑信息={_format_term(meta)}\n"

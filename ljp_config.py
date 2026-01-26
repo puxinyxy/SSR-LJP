@@ -14,11 +14,11 @@ EMBEDDING_API_KEY = "sk-d103be2645ca438d91892867a65cfd2c"
 
 # LLM for the agents (can still be overridden via CLI)
 # LLM候选
-# LLM_MODEL = "qwen3-max"
+LLM_MODEL = "qwen3-max"
 # LLM_MODEL = "qwen3-235b-a22b"
 # LLM_MODEL = "qwen3-14b"
 # LLM_MODEL = "qwen3-8b"
-LLM_MODEL = "deepseek-v3.2"
+# LLM_MODEL = "deepseek-v3.2"
 # 微调模型
 # LLM_MODEL = "qwen3-32b-ft-202512041704-057e"
 # LLM_MODEL = "qwen3-8b-ft-202512041940-a343"
@@ -26,7 +26,7 @@ LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 LLM_API_KEY = "sk-d103be2645ca438d91892867a65cfd2c"
 
 # Defaults for pipeline limits
-MAX_LAW_CHUNKS = 600
+MAX_LAW_CHUNKS = 1200
 MAX_CANDIDATES = 2000
 TOP_K = 3
 EMBED_BATCH = 10  # DashScope embedding batch limit (<=10)

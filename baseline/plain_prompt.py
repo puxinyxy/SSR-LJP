@@ -25,6 +25,7 @@ from openai import OpenAI
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+from logger_utils import log_metrics, setup_run_logger
 from ljp_eval import (
     _normalize_acc,
     _parse_judgment_json,
@@ -277,6 +278,11 @@ def evaluate_case_strict_cail(pred: Dict[str, str], truth: Dict) -> Dict[str, Op
 def main() -> None:
     args = parse_args()
     system_prompt = PROMPTS[args.prompt_type]
+    logger, run_dir, run_id = setup_run_logger(
+        run_name="baseline_plain_prompt",
+        args=vars(args),
+        extra={"cwd": str(Path.cwd())},
+    )
 
     # Choose eval utilities based on task
     if args.task == "cail2018":
@@ -295,6 +301,7 @@ def main() -> None:
         eval_func = evaluate_case_strict_cjo
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("config task=%s dataset_path=%s model=%s prompt_type=%s", args.task, dataset_path, args.model, args.prompt_type)
 
     total_raw = count_func(dataset_path) or 0
     if total_raw and args.limit is not None:
@@ -349,6 +356,7 @@ def main() -> None:
         evaluated += 1
         progress = f"[{evaluated}/{total_eval}]" if total_eval else f"[{evaluated}]"
         print(f"{progress} caseID={case_obj.get('caseID')}, metrics={m}")
+        logger.info("case_done caseID=%s metrics=%s", case_obj.get("caseID"), m)
 
     jsonl_file.close()
 
@@ -360,6 +368,7 @@ def main() -> None:
     print(f"Samples evaluated: {evaluated}")
     for k, v in summary.items():
         print(f"{k}: {v}")
+    log_metrics(logger, summary, prefix="summary")
     summary_path = out_dir / f"{args.prompt_type}_summary_{args.model}.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Saved jsonl to {jsonl_path}")

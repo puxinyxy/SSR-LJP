@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from openai import OpenAI
+from logger_utils import log_metrics, setup_run_logger
 
 # Ensure repository root is on sys.path when running as a script
 REPO_ROOT = Path(__file__).resolve().parent
@@ -498,6 +499,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    logger, run_dir, run_id = setup_run_logger(
+        run_name="eval_llm_rag_penalty",
+        args=vars(args),
+        extra={"cwd": str(Path.cwd())},
+    )
     data = load_dataset(args.dataset_path)
     if args.offset > 0:
         data = data[args.offset :]
@@ -514,6 +520,14 @@ def main() -> None:
     embedder = build_embedder(args.embedding_model)
     law_index = SimpleVectorIndex(embedder, law_texts)
     case_index = SimpleVectorIndex(embedder, precedent_texts)
+    logger.info(
+        "config dataset_path=%s precedent_file=%s law_dir=%s topk_case=%s topk_law=%s",
+        args.dataset_path,
+        args.precedent_file,
+        args.law_dir,
+        args.topk_case,
+        args.topk_law,
+    )
 
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -590,6 +604,7 @@ def main() -> None:
             }
             jf.write(json.dumps(record, ensure_ascii=False) + "\n")
             print(f"[{idx}/{len(data)}] case_id={case_id}")
+            logger.info("case_done case_id=%s", case_id)
 
         ma_p, ma_r, ma_f = _macro_from_stats(cls_stats)
         acc = (correct / total_eval) if total_eval else None
@@ -606,6 +621,7 @@ def main() -> None:
             },
         }
         jf.write(json.dumps(summary, ensure_ascii=False) + "\n")
+        log_metrics(logger, summary.get("metrics", {}), prefix="summary")
 
     if data:
         print("===== Metrics =====")
