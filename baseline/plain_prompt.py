@@ -16,6 +16,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from datetime import datetime
 from statistics import mean
 from typing import Dict, List, Optional
 
@@ -283,18 +284,21 @@ def main() -> None:
         args=vars(args),
         extra={"cwd": str(Path.cwd())},
     )
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Choose eval utilities based on task
     if args.task == "cail2018":
         dataset_path = Path(args.dataset or DEFAULT_DATASET_CAIL)
-        out_dir = Path(args.output_dir or f"{DEFAULT_OUTPUT_DIR_CAIL}_{args.model}_{args.prompt_type}")
+        base_out = args.output_dir or f"{DEFAULT_OUTPUT_DIR_CAIL}_{args.model}_{args.prompt_type}"
+        out_dir = Path(f"{base_out}_{ts}")
         metric_keys = ["law_acc", "acc_acc", "penalty_cls_acc"]
         iter_func = iter_testset_cail
         count_func = count_testset_cail
         eval_func = evaluate_case_strict_cail
     else:  # cjo22
         dataset_path = Path(args.dataset or DEFAULT_DATASET_CJO22)
-        out_dir = Path(args.output_dir or f"{DEFAULT_OUTPUT_DIR_CJO22}_{args.model}_{args.prompt_type}")
+        base_out = args.output_dir or f"{DEFAULT_OUTPUT_DIR_CJO22}_{args.model}_{args.prompt_type}"
+        out_dir = Path(f"{base_out}_{ts}")
         metric_keys = ["law_acc", "acc_acc", "imprison_abs_err", "penalty_cls_acc"]
         iter_func = iter_testset_cjo
         count_func = count_testset_cjo

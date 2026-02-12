@@ -31,7 +31,7 @@ from ljp_config import (
     LLM_MODEL,
     TOP_K,
 )
-from simple_vector_index import SimpleVectorIndex
+from ljp_tools import TextItem, build_index_cached, search_index
 
 
 SYSTEM_PROMPT = (
@@ -73,10 +73,19 @@ def load_dataset(path: str | Path) -> List[dict]:
 
 
 def load_law_articles(law_dir: str | Path) -> List[str]:
-    """Load law articles from *.txt files (one article per file)."""
+    """Load law articles from a single file (by lines) or a *.txt directory."""
     law_path = Path(law_dir)
     if not law_path.exists():
-        raise FileNotFoundError(f"Law dir not found: {law_path}")
+        raise FileNotFoundError(f"Law path not found: {law_path}")
+
+    if law_path.is_file():
+        text = law_path.read_text(encoding="utf-8", errors="ignore")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            return lines
+        stripped = text.strip()
+        return [stripped] if stripped else []
+
     files = sorted(law_path.glob("*.txt"))
     articles: List[str] = []
     for fp in files:
@@ -202,6 +211,26 @@ def _chinese_num_to_int(s: str) -> int:
 CN_NUM = "\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\u96f6\u4e24"
 
 
+def _extract_article_id(text: str) -> Optional[int]:
+    if not text:
+        return None
+    norm = _fullwidth_to_halfwidth(str(text))
+    m = re.search(r"\u7b2c\s*(\d{1,4})\s*\u6761", norm)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    m = re.search(rf"\u7b2c\s*([{CN_NUM}]+)\s*\u6761", str(text))
+    if m:
+        try:
+            val = _chinese_num_to_int(m.group(1))
+            return val if val else None
+        except Exception:
+            return None
+    return None
+
+
 def _extract_article_numbers(text: str) -> set[int]:
     text_hw = _fullwidth_to_halfwidth(text)
     nums = {int(n) for n in re.findall(r"\d{1,4}", text_hw)}
@@ -292,15 +321,26 @@ def _parse_prediction(text: str) -> Dict[str, Any]:
     return {"law_articles": law_articles}
 
 
-def _format_law_candidates(hits: Sequence[str], max_chars: int) -> str:
+def _format_law_candidates(hits: Sequence[Any], max_chars: int) -> str:
     if not hits:
         return "无"
-    lines = []
+    lines: List[str] = []
     for i, hit in enumerate(hits, 1):
-        snippet = hit.strip().replace("\n", " ")
+        label = None
+        if isinstance(hit, TextItem):
+            snippet = hit.text
+            article_id = (hit.meta or {}).get("article_id")
+            if isinstance(article_id, int) and article_id > 0:
+                label = f"第{article_id}条"
+        else:
+            snippet = str(hit)
+        snippet = snippet.strip().replace("\n", " ")
         if max_chars > 0:
             snippet = snippet[:max_chars]
-        lines.append(f"候选{i}：{snippet}")
+        if label:
+            lines.append(f"候选{i}（{label}）：{snippet}")
+        else:
+            lines.append(f"候选{i}：{snippet}")
     return "\n".join(lines)
 
 
@@ -344,7 +384,7 @@ def parse_args() -> argparse.Namespace:
         "--law-dir",
         dest="law_dir",
         type=str,
-        default="data/law_articles",
+        default="data/meta/laws.txt",
     )
     parser.add_argument("--output_path", type=str, default=None)
     parser.add_argument("--limit", type=int, default=0, help="0 means all")
@@ -378,14 +418,55 @@ def main() -> None:
     law_texts = load_law_articles(args.law_dir)
     if not law_texts:
         raise ValueError(f"No law articles found in {args.law_dir}")
+    law_items = [
+        TextItem(
+            text=text,
+            meta={
+                "source": "law_article",
+                "chunk_id": i,
+                "article_id": _extract_article_id(text),
+            },
+        )
+        for i, text in enumerate(law_texts)
+    ]
 
     embedder = build_embedder(args.embedding_model)
-    law_index = SimpleVectorIndex(embedder, law_texts)
+    law_path = Path(args.law_dir)
+    if law_path.is_file():
+        src_mtime = law_path.stat().st_mtime
+        src_size = law_path.stat().st_size
+        src_files = 1
+    else:
+        txt_files = sorted(law_path.glob("*.txt"))
+        src_files = len(txt_files)
+        src_mtime = max((fp.stat().st_mtime for fp in txt_files), default=law_path.stat().st_mtime)
+        src_size = sum((fp.stat().st_size for fp in txt_files), 0)
+
+    cache_dir = Path("output/embedding_cache")
+    law_meta = {
+        "source": str(law_path),
+        "source_mtime": src_mtime,
+        "source_size": src_size,
+        "source_files": src_files,
+        "num_items": len(law_items),
+        "embedding_model": args.embedding_model,
+        "embedding_base_url": EMBEDDING_BASE_URL,
+    }
+    law_index = build_index_cached(
+        embedder,
+        law_items,
+        batch_size=10,
+        cache_dir=cache_dir,
+        cache_prefix="law_eval",
+        meta=law_meta,
+    )
     logger.info(
-        "config dataset_path=%s law_dir=%s topk_law=%s",
+        "config dataset_path=%s law_dir=%s topk_law=%s law_items=%s cache_dir=%s",
         args.dataset_path,
         args.law_dir,
         args.topk_law,
+        len(law_items),
+        str(cache_dir),
     )
 
     if args.output_path:
@@ -407,7 +488,7 @@ def main() -> None:
             prompt_fact = fact
             if args.max_fact_chars > 0:
                 prompt_fact = prompt_fact[: args.max_fact_chars]
-            law_hits = law_index.search(fact, args.topk_law)
+            law_hits = search_index(law_index, fact, args.topk_law)
             law_block = _format_law_candidates(law_hits, args.max_law_chars)
 
             user_prompt = (

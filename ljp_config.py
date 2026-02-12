@@ -14,8 +14,8 @@ EMBEDDING_API_KEY = "sk-d103be2645ca438d91892867a65cfd2c"
 
 # LLM for the agents (can still be overridden via CLI)
 # LLM候选
-LLM_MODEL = "qwen3-max"
-# LLM_MODEL = "qwen3-235b-a22b"
+# LLM_MODEL = "qwen3-max"
+LLM_MODEL = "qwen3-235b-a22b"
 # LLM_MODEL = "qwen3-14b"
 # LLM_MODEL = "qwen3-8b"
 # LLM_MODEL = "deepseek-v3.2"
@@ -27,6 +27,6 @@ LLM_API_KEY = "sk-d103be2645ca438d91892867a65cfd2c"
 
 # Defaults for pipeline limits
 MAX_LAW_CHUNKS = 1200
-MAX_CANDIDATES = 2000
+MAX_CANDIDATES = 0  # 0 means no limit
 TOP_K = 3
 EMBED_BATCH = 10  # DashScope embedding batch limit (<=10)

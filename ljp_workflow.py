@@ -29,7 +29,7 @@ from ljp_config import (
     LLM_MODEL,
 )
 from ljp_tools import (
-    build_index,
+    build_index_cached,
     load_accusations,
     load_candidates,
     load_law_articles,
@@ -66,7 +66,8 @@ def build_resources(args, candidates_path: Path | None = None) -> PipelineResour
 
     # Load data
     law_items = load_law_articles(law_path, max_chunks=args.max_law_chunks)
-    candidates = load_candidates(candidates_path, max_items=args.max_candidates)
+    max_items = args.max_candidates if getattr(args, "max_candidates", 0) and args.max_candidates > 0 else None
+    candidates = load_candidates(candidates_path, max_items=max_items)
     accusation_items = load_accusations(candidates)
 
     # Embedding model is locked to config
@@ -75,9 +76,55 @@ def build_resources(args, candidates_path: Path | None = None) -> PipelineResour
         api_key=EMBEDDING_API_KEY,
         url=EMBEDDING_BASE_URL,
     )
-    law_index = build_index(embedder, law_items, batch_size=args.embed_batch)
-    acc_index = build_index(embedder, accusation_items, batch_size=args.embed_batch)
-    cand_index = build_index(embedder, candidates, batch_size=args.embed_batch)
+    cache_dir = Path("output/embedding_cache")
+    law_meta = {
+        "source": str(law_path),
+        "source_mtime": law_path.stat().st_mtime,
+        "source_size": law_path.stat().st_size,
+        "max_chunks": args.max_law_chunks,
+        "chunk_max_chars": 480,
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_base_url": EMBEDDING_BASE_URL,
+    }
+    candidates_meta = {
+        "source": str(candidates_path),
+        "source_mtime": Path(candidates_path).stat().st_mtime,
+        "source_size": Path(candidates_path).stat().st_size,
+        "max_items": max_items or 0,
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_base_url": EMBEDDING_BASE_URL,
+    }
+    acc_meta = {
+        "type": "accusations",
+        "source_candidates": candidates_meta,
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_base_url": EMBEDDING_BASE_URL,
+    }
+
+    law_index = build_index_cached(
+        embedder,
+        law_items,
+        batch_size=args.embed_batch,
+        cache_dir=cache_dir,
+        cache_prefix="law",
+        meta=law_meta,
+    )
+    acc_index = build_index_cached(
+        embedder,
+        accusation_items,
+        batch_size=args.embed_batch,
+        cache_dir=cache_dir,
+        cache_prefix="acc",
+        meta=acc_meta,
+    )
+    cand_index = build_index_cached(
+        embedder,
+        candidates,
+        batch_size=args.embed_batch,
+        cache_dir=cache_dir,
+        cache_prefix="candidates",
+        meta=candidates_meta,
+    )
 
     # LLM for agents
     llm = make_llm(
@@ -117,15 +164,29 @@ def predict_case(case_fact: str, resources: PipelineResources, top_k: int):
     # Retrieve candidates
     law_hits = search_index(resources.law_index, case_fact, top_k)
     acc_hits = search_index(resources.acc_index, case_fact, top_k)
-    prelim_laws = [f"[{h.meta['chunk_id']}] {h.text[:150]}" for h in law_hits]
+    prelim_laws = []
+    for h in law_hits:
+        meta = h.meta or {}
+        article_id = meta.get("article_id")
+        if isinstance(article_id, int) and article_id > 0:
+            label = f"第{article_id}条"
+        else:
+            label = f"chunk_{meta.get('chunk_id')}"
+        prelim_laws.append(f"[{label}] {h.text[:150]}")
     prelim_acc = [h.meta["accusation"] for h in acc_hits]
 
+    fact_text = case_fact.strip()
+    if len(fact_text) <= 1600:
+        fact_slice = fact_text
+    else:
+        fact_slice = f"{fact_text[:800]}\n...\n{fact_text[-800:]}"
     cand_query = (
-        case_fact[:800]
-        + "\n候选法条: "
+        "候选法条: "
         + ", ".join(prelim_laws[:3])
         + "\n候选罪名: "
         + ", ".join(prelim_acc)
+        + "\n案情摘要: "
+        + fact_slice
     )
     cand_hits = search_index(resources.cand_index, cand_query, top_k)
 

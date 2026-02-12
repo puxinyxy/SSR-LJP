@@ -5,11 +5,14 @@ Utility functions: data loading, text chunking, embedding, and vector search.
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import List, Sequence
+from typing import Any, List, Sequence
 
 import numpy as np
+import re
 
 from camel.embeddings import OpenAICompatibleEmbedding
 
@@ -39,19 +42,86 @@ def chunk_text(text: str, max_chars: int = 480) -> List[str]:
     return chunks
 
 
+_CN_NUM = "一二三四五六七八九十百千零两"
+_FW_DIGITS = "０１２３４５６７８９"
+_HW_DIGITS = "0123456789"
+
+
+def _fullwidth_to_halfwidth(s: str) -> str:
+    return s.translate(str.maketrans(_FW_DIGITS, _HW_DIGITS))
+
+
+def _chinese_num_to_int(s: str) -> int:
+    digit_map = {
+        "零": 0,
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    unit_map = {"十": 10, "百": 100, "千": 1000}
+    total = 0
+    num = 0
+    for ch in s:
+        if ch in digit_map:
+            num = digit_map[ch]
+        elif ch in unit_map:
+            unit = unit_map[ch]
+            if num == 0:
+                num = 1
+            total += num * unit
+            num = 0
+    total += num
+    return total
+
+
+def _extract_article_id(text: str) -> int | None:
+    if not text:
+        return None
+    norm = _fullwidth_to_halfwidth(text)
+    m = re.search(r"第\\s*(\\d{1,4})\\s*条", norm)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    m = re.search(rf"第\\s*([{_CN_NUM}]+)\\s*条", text)
+    if m:
+        try:
+            val = _chinese_num_to_int(m.group(1))
+            return val if val else None
+        except Exception:
+            return None
+    return None
+
+
 def load_law_articles(path: Path, max_chunks: int) -> List[TextItem]:
     raw = path.read_text(encoding="utf-8", errors="ignore")
     chunks = chunk_text(raw)
     limited = chunks[:max_chunks]
     return [
-        TextItem(text=c, meta={"source": "law_article", "chunk_id": i})
+        TextItem(
+            text=c,
+            meta={
+                "source": "law_article",
+                "chunk_id": i,
+                "article_id": _extract_article_id(c),
+            },
+        )
         for i, c in enumerate(limited)
     ]
 
 
-def load_candidates(path: Path, max_items: int) -> List[TextItem]:
+def load_candidates(path: Path, max_items: int | None) -> List[TextItem]:
     items: List[TextItem] = []
     text = path.read_text(encoding="utf-8", errors="ignore").strip()
+    max_items_limit = max_items if isinstance(max_items, int) and max_items > 0 else None
     # Detect JSON array vs JSONL
     if text.startswith("["):
         try:
@@ -60,7 +130,7 @@ def load_candidates(path: Path, max_items: int) -> List[TextItem]:
         except json.JSONDecodeError:
             iterable = []
         for i, obj in enumerate(iterable):
-            if i >= max_items:
+            if max_items_limit is not None and i >= max_items_limit:
                 break
             if not isinstance(obj, dict):
                 continue
@@ -82,7 +152,7 @@ def load_candidates(path: Path, max_items: int) -> List[TextItem]:
 
     with path.open("r", encoding="utf-8") as f:
         for i, line in enumerate(f):
-            if i >= max_items:
+            if max_items_limit is not None and i >= max_items_limit:
                 break
             line = line.strip()
             if not line:
@@ -180,6 +250,54 @@ def build_index(
     batch_size: int = 32,
 ) -> VectorIndex:
     vectors = batch_embed(embedder, [item.text for item in items], batch_size)
+    return VectorIndex(texts=list(items), vectors=vectors, embedder=embedder)
+
+
+def _meta_signature(meta: dict) -> str:
+    payload = json.dumps(meta, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.md5(payload).hexdigest()
+
+
+def build_index_cached(
+    embedder: OpenAICompatibleEmbedding,
+    items: Sequence[TextItem],
+    batch_size: int,
+    cache_dir: Path,
+    cache_prefix: str,
+    meta: dict,
+) -> VectorIndex:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    signature = _meta_signature(meta)
+    cache_name = f"{cache_prefix}_{signature[:12]}"
+    vec_path = cache_dir / f"{cache_name}.npy"
+    meta_path = cache_dir / f"{cache_name}.json"
+
+    if vec_path.exists() and meta_path.exists():
+        try:
+            cached_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if cached_meta.get("signature") == signature and cached_meta.get("num_items") == len(items):
+                vecs = np.load(vec_path)
+                if vecs.ndim == 2 and vecs.shape[0] == len(items):
+                    vectors = [vecs[i] for i in range(vecs.shape[0])]
+                    return VectorIndex(texts=list(items), vectors=vectors, embedder=embedder)
+        except Exception:
+            pass
+
+    vectors = batch_embed(embedder, [item.text for item in items], batch_size)
+    if vectors:
+        vec_arr = np.stack(vectors).astype(np.float32, copy=False)
+    else:
+        vec_arr = np.zeros((0, 0), dtype=np.float32)
+    np.save(vec_path, vec_arr)
+    meta_out: dict[str, Any] = dict(meta)
+    meta_out.update(
+        {
+            "signature": signature,
+            "num_items": len(items),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    meta_path.write_text(json.dumps(meta_out, ensure_ascii=False, indent=2), encoding="utf-8")
     return VectorIndex(texts=list(items), vectors=vectors, embedder=embedder)
 
 

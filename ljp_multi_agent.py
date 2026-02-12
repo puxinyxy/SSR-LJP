@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LJP multi-agent demo")
     parser.add_argument("--case-id", type=int, default=0, help="caseID in testset")
     parser.add_argument("--max-law-chunks", type=int, default=MAX_LAW_CHUNKS)
-    parser.add_argument("--max-candidates", type=int, default=MAX_CANDIDATES)
+    parser.add_argument("--max-candidates", type=int, default=MAX_CANDIDATES, help="0 means no limit")
     parser.add_argument("--top-k", type=int, default=TOP_K, help="top-k retrieval")
     parser.add_argument("--embed-batch", type=int, default=EMBED_BATCH)
 
