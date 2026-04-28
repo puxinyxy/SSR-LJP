@@ -16,3 +16,5 @@ baseline_output/
 
 # 忽略embedding执行结果
 embedding_output/
+
+data/
