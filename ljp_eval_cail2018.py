@@ -146,7 +146,8 @@ def main():
     parser.add_argument(
         "--dataset-path",
         type=str,
-        default="data/testset/cail_sampled.json",
+        # default="data/testset/cail_sampled.json",
+        default="data/testset/test_sampled_single_seed_42.json",
         help="Path to CAIL2018 test JSONL (default: data/testset/cail_sampled.json)",
     )
     parser.add_argument("--output-dir", type=str, default="output_cail2018", help="Directory to save results")
