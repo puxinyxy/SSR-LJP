@@ -27,9 +27,13 @@ from ljp_config import (
     LLM_API_KEY,
     LLM_BASE_URL,
     LLM_MODEL,
+    RERANK_MODEL,
+    RERANK_TIMEOUT,
+    RERANK_TOP_K,
+    RERANK_URL,
 )
 from ljp_tools import (
-    build_index_cached,
+    build_retrieval_index_cached,
     load_accusations,
     load_candidates,
     load_law_articles,
@@ -39,6 +43,7 @@ from ljp_tools import (
     search_index,
     TextItem,
 )
+from ljp_hybrid_retrieval import prepare_retrieval_query
 
 
 @dataclass
@@ -55,7 +60,9 @@ class PipelineResources:
 
 def build_resources(args, candidates_path: Path | None = None) -> PipelineResources:
     data_dir = Path("data")
-    law_path = Path(r"G:\\graduate_1\\Code\\Camel\\data\\meta\\laws.txt")
+    law_path = data_dir / "meta" / "laws.txt"
+    if not law_path.exists():
+        law_path = Path(r"G:\\graduate_1\\Code\\Camel\\data\\meta\\laws.txt")
     if not law_path.exists():
         raise FileNotFoundError(f"Law articles file not found: {law_path}")
     if candidates_path is None:
@@ -82,7 +89,8 @@ def build_resources(args, candidates_path: Path | None = None) -> PipelineResour
         "source_mtime": law_path.stat().st_mtime,
         "source_size": law_path.stat().st_size,
         "max_chunks": args.max_law_chunks,
-        "chunk_max_chars": 480,
+        "grouped_by_article": True,
+        "num_items": len(law_items),
         "embedding_model": EMBEDDING_MODEL,
         "embedding_base_url": EMBEDDING_BASE_URL,
     }
@@ -101,29 +109,90 @@ def build_resources(args, candidates_path: Path | None = None) -> PipelineResour
         "embedding_base_url": EMBEDDING_BASE_URL,
     }
 
-    law_index = build_index_cached(
+    retrieval_mode = getattr(args, "retrieval_mode", "hybrid")
+    dense_top_k = getattr(args, "dense_top_k", 50)
+    bm25_top_k = getattr(args, "bm25_top_k", 50)
+    keyword_top_k = getattr(args, "keyword_top_k", 30)
+    join_top_k = getattr(args, "join_top_k", 50)
+    rrf_k = getattr(args, "rrf_k", 60.0)
+    dense_weight = getattr(args, "dense_weight", 2.0)
+    bm25_weight = getattr(args, "bm25_weight", 0.7)
+    keyword_weight = getattr(args, "keyword_weight", 0.3)
+    query_max_chars = getattr(args, "retrieval_query_max_chars", 2000)
+    use_rerank = getattr(args, "use_rerank", False)
+    rerank_top_k = getattr(args, "rerank_top_k", RERANK_TOP_K)
+
+    law_index = build_retrieval_index_cached(
         embedder,
         law_items,
         batch_size=args.embed_batch,
         cache_dir=cache_dir,
         cache_prefix="law",
         meta=law_meta,
+        retrieval_mode=retrieval_mode,
+        dense_top_k=dense_top_k,
+        bm25_top_k=bm25_top_k,
+        keyword_top_k=keyword_top_k,
+        join_top_k=join_top_k,
+        rrf_k=rrf_k,
+        dense_weight=dense_weight,
+        bm25_weight=bm25_weight,
+        keyword_weight=keyword_weight,
+        query_max_chars=query_max_chars,
+        use_rerank=use_rerank,
+        rerank_top_k=rerank_top_k,
+        rerank_model=RERANK_MODEL,
+        rerank_url=RERANK_URL,
+        rerank_api_key=EMBEDDING_API_KEY,
+        rerank_timeout=RERANK_TIMEOUT,
     )
-    acc_index = build_index_cached(
+    acc_index = build_retrieval_index_cached(
         embedder,
         accusation_items,
         batch_size=args.embed_batch,
         cache_dir=cache_dir,
         cache_prefix="acc",
         meta=acc_meta,
+        retrieval_mode=retrieval_mode,
+        dense_top_k=dense_top_k,
+        bm25_top_k=bm25_top_k,
+        keyword_top_k=keyword_top_k,
+        join_top_k=join_top_k,
+        rrf_k=rrf_k,
+        dense_weight=dense_weight,
+        bm25_weight=bm25_weight,
+        keyword_weight=keyword_weight,
+        query_max_chars=query_max_chars,
+        use_rerank=use_rerank,
+        rerank_top_k=rerank_top_k,
+        rerank_model=RERANK_MODEL,
+        rerank_url=RERANK_URL,
+        rerank_api_key=EMBEDDING_API_KEY,
+        rerank_timeout=RERANK_TIMEOUT,
     )
-    cand_index = build_index_cached(
+    cand_index = build_retrieval_index_cached(
         embedder,
         candidates,
         batch_size=args.embed_batch,
         cache_dir=cache_dir,
         cache_prefix="candidates",
         meta=candidates_meta,
+        retrieval_mode=retrieval_mode,
+        dense_top_k=dense_top_k,
+        bm25_top_k=bm25_top_k,
+        keyword_top_k=keyword_top_k,
+        join_top_k=join_top_k,
+        rrf_k=rrf_k,
+        dense_weight=dense_weight,
+        bm25_weight=bm25_weight,
+        keyword_weight=keyword_weight,
+        query_max_chars=query_max_chars,
+        use_rerank=use_rerank,
+        rerank_top_k=rerank_top_k,
+        rerank_model=RERANK_MODEL,
+        rerank_url=RERANK_URL,
+        rerank_api_key=EMBEDDING_API_KEY,
+        rerank_timeout=RERANK_TIMEOUT,
     )
 
     # LLM for agents
@@ -162,8 +231,14 @@ def predict_case(case_fact: str, resources: PipelineResources, top_k: int):
                 pass
 
     # Retrieve candidates
-    law_hits = search_index(resources.law_index, case_fact, top_k)
-    acc_hits = search_index(resources.acc_index, case_fact, top_k)
+    retrieval_query = prepare_retrieval_query(
+        case_fact,
+        getattr(resources.law_index, "config", None).query_max_chars
+        if getattr(resources.law_index, "config", None) is not None
+        else 2000,
+    )
+    law_hits = search_index(resources.law_index, retrieval_query, top_k)
+    acc_hits = search_index(resources.acc_index, retrieval_query, top_k)
     prelim_laws = []
     for h in law_hits:
         meta = h.meta or {}

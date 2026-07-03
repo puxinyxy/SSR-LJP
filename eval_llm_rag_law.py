@@ -23,22 +23,59 @@ if str(REPO_ROOT) not in sys.path:
 from camel.embeddings import OpenAICompatibleEmbedding
 
 from ljp_config import (
+    BM25_TOP_K,
+    BM25_SCORE_WEIGHT,
+    BM25_WEIGHT,
+    DENSE_ANCHOR,
+    DENSE_MARGIN_THRESHOLD,
+    DENSE_OVERRIDE_THRESHOLD,
+    DENSE_SCORE_WEIGHT,
+    DENSE_TOP_K,
+    DENSE_WEIGHT,
     EMBEDDING_API_KEY,
     EMBEDDING_BASE_URL,
     EMBEDDING_MODEL,
+    FUSION_MODE,
+    JOIN_TOP_K,
+    KEYWORD_TOP_K,
+    KEYWORD_SCORE_WEIGHT,
+    KEYWORD_WEIGHT,
+    LAW_MAX_OUTPUT_ARTICLES,
+    LEGAL_AWARE_RERANK,
+    LEXICAL_INCLUDE_NUMERIC,
     LLM_API_KEY,
     LLM_BASE_URL,
     LLM_MODEL,
+    RERANK_TOP_K,
+    RERANK_MODEL,
+    RERANK_SCORE_WEIGHT,
+    RERANK_TIMEOUT,
+    RERANK_URL,
+    RETRIEVAL_MODE,
+    RETRIEVAL_QUERY_MAX_CHARS,
+    RRF_K,
     TOP_K,
+    USE_RERANK,
 )
-from ljp_tools import TextItem, build_index_cached, search_index
+from ljp_law_query import LawRetrievalQueries, prepare_law_retrieval_queries
+from ljp_tools import (
+    TextItem,
+    build_retrieval_index_cached,
+    extract_article_key,
+    load_grouped_law_texts,
+    search_index,
+)
 
 
 SYSTEM_PROMPT = (
-    "请从法律适用角度选择本案应当适用的主要刑法条文。"
+    "请选择一个最直接决定本案罪名成立的主要刑法条文。"
+    "必须只输出一个法条。"
+    "不要输出仅涉及自首、坦白、退赃、谅解、累犯、立功、缓刑、"
+    "没收财产、从轻或从重处罚的一般量刑条文。"
+    "如果多个条文均相关，选择最直接规定犯罪构成和罪名的条文。"
     "最终只输出一个合法 JSON 对象，不要输出任何解释或 Markdown。"
-    "JSON 仅包含字段 \"law_articles\"，值为字符串数组，"
-    "例如：{ \"law_articles\": [\"刑法第264条\", \"刑法第340条\"] }。"
+    "JSON 仅包含字段 \"law_articles\"，值为仅含一个字符串的数组，"
+    "例如：{ \"law_articles\": [\"刑法第264条\"] }。"
 )
 
 
@@ -73,26 +110,8 @@ def load_dataset(path: str | Path) -> List[dict]:
 
 
 def load_law_articles(law_dir: str | Path) -> List[str]:
-    """Load law articles from a single file (by lines) or a *.txt directory."""
-    law_path = Path(law_dir)
-    if not law_path.exists():
-        raise FileNotFoundError(f"Law path not found: {law_path}")
-
-    if law_path.is_file():
-        text = law_path.read_text(encoding="utf-8", errors="ignore")
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if lines:
-            return lines
-        stripped = text.strip()
-        return [stripped] if stripped else []
-
-    files = sorted(law_path.glob("*.txt"))
-    articles: List[str] = []
-    for fp in files:
-        text = fp.read_text(encoding="utf-8", errors="ignore").strip()
-        if text:
-            articles.append(text)
-    return articles
+    """Load complete law articles, merging continuation lines by article."""
+    return load_grouped_law_texts(law_dir)
 
 
 def build_embedder(embedding_model: str) -> OpenAICompatibleEmbedding:
@@ -233,16 +252,18 @@ def _extract_article_id(text: str) -> Optional[int]:
 
 def _extract_article_numbers(text: str) -> set[int]:
     text_hw = _fullwidth_to_halfwidth(text)
-    nums = {int(n) for n in re.findall(r"\d{1,4}", text_hw)}
-
-    pattern = rf"[\u7b2c]?([{CN_NUM}]+)[\u6761\u7bc7]?"
-    for m in re.findall(pattern, text):
+    nums: set[int] = set()
+    pattern = re.compile(rf"\u7b2c\s*(\d{{1,4}}|[{CN_NUM}]+)\s*\u6761")
+    for match in pattern.finditer(text_hw):
+        raw = match.group(1)
         try:
-            val = _chinese_num_to_int(m)
+            val = int(raw) if raw.isdigit() else _chinese_num_to_int(raw)
             if val:
                 nums.add(val)
         except Exception:
             continue
+    if not nums and re.fullmatch(r"\s*\d{1,4}\s*", text_hw):
+        nums.add(int(text_hw.strip()))
     return nums
 
 
@@ -304,7 +325,10 @@ def _get_case_imprisonment(obj: dict) -> int:
     return val if val is not None else 0
 
 
-def _parse_prediction(text: str) -> Dict[str, Any]:
+def _parse_prediction(
+    text: str,
+    max_output_articles: int = LAW_MAX_OUTPUT_ARTICLES,
+) -> Dict[str, Any]:
     obj = _safe_json_load(text)
     if not isinstance(obj, dict):
         return {"law_articles": [], "raw_output": text}
@@ -318,6 +342,8 @@ def _parse_prediction(text: str) -> Dict[str, Any]:
     law_articles = _normalize_law_articles(law_val)
     if not law_articles and not (isinstance(law_val, list) and len(law_val) == 0):
         return {"law_articles": [], "raw_output": text}
+    if max_output_articles > 0:
+        law_articles = law_articles[:max_output_articles]
     return {"law_articles": law_articles}
 
 
@@ -342,6 +368,18 @@ def _format_law_candidates(hits: Sequence[Any], max_chars: int) -> str:
         else:
             lines.append(f"候选{i}：{snippet}")
     return "\n".join(lines)
+
+
+def _prepare_retrieval_input(
+    fact: str,
+    max_chars: int,
+    retrieval_mode: str,
+    law_query_rewrite: bool,
+) -> tuple[LawRetrievalQueries, str | LawRetrievalQueries]:
+    queries = prepare_law_retrieval_queries(fact, max_chars)
+    if retrieval_mode == "hybrid" and law_query_rewrite:
+        return queries, queries
+    return queries, queries.dense_query
 
 
 def call_llm(
@@ -391,6 +429,116 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--topk_law", type=int, default=TOP_K)
     parser.add_argument("--topk_case", type=int, default=TOP_K, help="Unused in law-only eval")
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=("hybrid", "embedding"),
+        default=RETRIEVAL_MODE,
+        help="Retrieval mode. hybrid uses dense+BM25+keyword fusion.",
+    )
+    parser.add_argument("--dense-top-k", type=int, default=DENSE_TOP_K)
+    parser.add_argument("--bm25-top-k", type=int, default=BM25_TOP_K)
+    parser.add_argument("--keyword-top-k", type=int, default=KEYWORD_TOP_K)
+    parser.add_argument("--join-top-k", type=int, default=JOIN_TOP_K)
+    parser.add_argument("--rrf-k", type=float, default=RRF_K)
+    parser.add_argument("--dense-weight", type=float, default=DENSE_WEIGHT)
+    parser.add_argument("--bm25-weight", type=float, default=BM25_WEIGHT)
+    parser.add_argument("--keyword-weight", type=float, default=KEYWORD_WEIGHT)
+    parser.add_argument(
+        "--fusion-mode",
+        choices=("rrf", "score"),
+        default=FUSION_MODE,
+        help="Hybrid fusion strategy. score preserves branch confidence.",
+    )
+    parser.add_argument(
+        "--dense-score-weight",
+        type=float,
+        default=DENSE_SCORE_WEIGHT,
+    )
+    parser.add_argument(
+        "--bm25-score-weight",
+        type=float,
+        default=BM25_SCORE_WEIGHT,
+    )
+    parser.add_argument(
+        "--keyword-score-weight",
+        type=float,
+        default=KEYWORD_SCORE_WEIGHT,
+    )
+    parser.add_argument(
+        "--rerank-score-weight",
+        type=float,
+        default=RERANK_SCORE_WEIGHT,
+    )
+    parser.add_argument("--dense-anchor", dest="dense_anchor", action="store_true")
+    parser.add_argument("--no-dense-anchor", dest="dense_anchor", action="store_false")
+    parser.set_defaults(dense_anchor=DENSE_ANCHOR)
+    parser.add_argument(
+        "--dense-margin-threshold",
+        type=float,
+        default=DENSE_MARGIN_THRESHOLD,
+    )
+    parser.add_argument(
+        "--dense-override-threshold",
+        type=float,
+        default=DENSE_OVERRIDE_THRESHOLD,
+    )
+    parser.add_argument(
+        "--legal-aware-rerank",
+        dest="legal_aware_rerank",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-legal-aware-rerank",
+        dest="legal_aware_rerank",
+        action="store_false",
+    )
+    parser.set_defaults(legal_aware_rerank=LEGAL_AWARE_RERANK)
+    parser.add_argument(
+        "--lexical-include-numeric",
+        dest="lexical_include_numeric",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-lexical-include-numeric",
+        dest="lexical_include_numeric",
+        action="store_false",
+    )
+    parser.set_defaults(lexical_include_numeric=LEXICAL_INCLUDE_NUMERIC)
+    parser.add_argument(
+        "--law-query-rewrite",
+        dest="law_query_rewrite",
+        action="store_true",
+        help="Use legal-element queries for sparse and rerank branches.",
+    )
+    parser.add_argument(
+        "--no-law-query-rewrite",
+        dest="law_query_rewrite",
+        action="store_false",
+        help="Use the normalized full fact for every retrieval branch.",
+    )
+    parser.set_defaults(law_query_rewrite=True)
+    parser.add_argument(
+        "--retrieval-query-max-chars",
+        type=int,
+        default=RETRIEVAL_QUERY_MAX_CHARS,
+        help="Use normalized head+tail text for retrieval; 0 keeps the full fact.",
+    )
+    parser.add_argument("--use-rerank", dest="use_rerank", action="store_true")
+    parser.add_argument("--no-rerank", dest="use_rerank", action="store_false")
+    parser.set_defaults(use_rerank=USE_RERANK)
+    parser.add_argument("--rerank-top-k", type=int, default=RERANK_TOP_K)
+    parser.add_argument(
+        "--retrieval-record-top-k",
+        type=int,
+        default=RERANK_TOP_K,
+        help="Ranking depth saved for retrieval metrics; LLM still receives --topk_law.",
+    )
+    parser.add_argument(
+        "--max-output-articles",
+        type=int,
+        default=LAW_MAX_OUTPUT_ARTICLES,
+        help="Maximum parsed law predictions; 0 keeps all returned articles.",
+    )
     parser.add_argument("--max-law-chars", type=int, default=400)
     parser.add_argument("--max-fact-chars", type=int, default=2000)
     parser.add_argument("--embedding_model", type=str, default=EMBEDDING_MODEL)
@@ -404,6 +552,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.max_output_articles < 0:
+        raise SystemExit("--max-output-articles must be >= 0")
+    if args.retrieval_record_top_k < args.topk_law:
+        raise SystemExit("--retrieval-record-top-k must be >= --topk_law")
+    if min(
+        args.dense_score_weight,
+        args.bm25_score_weight,
+        args.keyword_score_weight,
+        args.rerank_score_weight,
+    ) < 0:
+        raise SystemExit("score fusion weights must be non-negative")
     logger, run_dir, run_id = setup_run_logger(
         run_name="eval_llm_rag_law",
         args=vars(args),
@@ -423,8 +582,9 @@ def main() -> None:
             text=text,
             meta={
                 "source": "law_article",
-                "chunk_id": i,
+                "item_id": i,
                 "article_id": _extract_article_id(text),
+                "article_key": extract_article_key(text),
             },
         )
         for i, text in enumerate(law_texts)
@@ -451,22 +611,58 @@ def main() -> None:
         "num_items": len(law_items),
         "embedding_model": args.embedding_model,
         "embedding_base_url": EMBEDDING_BASE_URL,
+        "retrieval_mode": args.retrieval_mode,
     }
-    law_index = build_index_cached(
+    law_index = build_retrieval_index_cached(
         embedder,
         law_items,
         batch_size=10,
         cache_dir=cache_dir,
         cache_prefix="law_eval",
         meta=law_meta,
+        retrieval_mode=args.retrieval_mode,
+        dense_top_k=args.dense_top_k,
+        bm25_top_k=args.bm25_top_k,
+        keyword_top_k=args.keyword_top_k,
+        join_top_k=args.join_top_k,
+        rrf_k=args.rrf_k,
+        dense_weight=args.dense_weight,
+        bm25_weight=args.bm25_weight,
+        keyword_weight=args.keyword_weight,
+        fusion_mode=args.fusion_mode,
+        dense_score_weight=args.dense_score_weight,
+        bm25_score_weight=args.bm25_score_weight,
+        keyword_score_weight=args.keyword_score_weight,
+        rerank_score_weight=args.rerank_score_weight,
+        dense_anchor=args.dense_anchor,
+        dense_margin_threshold=args.dense_margin_threshold,
+        dense_override_threshold=args.dense_override_threshold,
+        legal_aware_rerank=args.legal_aware_rerank,
+        lexical_include_numeric=args.lexical_include_numeric,
+        query_max_chars=args.retrieval_query_max_chars,
+        use_rerank=args.use_rerank,
+        rerank_top_k=args.rerank_top_k,
+        rerank_model=RERANK_MODEL,
+        rerank_url=RERANK_URL,
+        rerank_api_key=EMBEDDING_API_KEY,
+        rerank_timeout=RERANK_TIMEOUT,
     )
     logger.info(
-        "config dataset_path=%s law_dir=%s topk_law=%s law_items=%s cache_dir=%s",
+        "config dataset_path=%s law_dir=%s topk_law=%s law_items=%s cache_dir=%s retrieval_mode=%s fusion_mode=%s rrf_weights=%s/%s/%s score_weights=%s/%s/%s/%s",
         args.dataset_path,
         args.law_dir,
         args.topk_law,
         len(law_items),
         str(cache_dir),
+        args.retrieval_mode,
+        args.fusion_mode,
+        args.dense_weight,
+        args.bm25_weight,
+        args.keyword_weight,
+        args.dense_score_weight,
+        args.bm25_score_weight,
+        args.keyword_score_weight,
+        args.rerank_score_weight,
     )
 
     if args.output_path:
@@ -480,6 +676,9 @@ def main() -> None:
     ma_p_scores: List[float] = []
     ma_r_scores: List[float] = []
     ma_f_scores: List[float] = []
+    primary_hit_scores: List[float] = []
+    single_gold_acc_scores: List[float] = []
+    multi_gold_recall_scores: List[float] = []
 
     with output_path.open("w", encoding="utf-8") as jf:
         for idx, case in enumerate(data, 1):
@@ -488,13 +687,54 @@ def main() -> None:
             prompt_fact = fact
             if args.max_fact_chars > 0:
                 prompt_fact = prompt_fact[: args.max_fact_chars]
-            law_hits = search_index(law_index, fact, args.topk_law)
+            retrieval_queries, retrieval_input = _prepare_retrieval_input(
+                fact,
+                args.retrieval_query_max_chars,
+                args.retrieval_mode,
+                args.law_query_rewrite,
+            )
+            retrieval_top_k = (
+                args.retrieval_record_top_k
+                if args.retrieval_mode == "embedding"
+                else args.topk_law
+            )
+            ranked_law_hits = search_index(
+                law_index,
+                retrieval_input,
+                retrieval_top_k,
+            )
+            law_hits = ranked_law_hits[: args.topk_law]
+            retrieval_debug = getattr(law_index, "last_search_debug", None)
+            actual_queries = (
+                retrieval_debug.get("queries")
+                if isinstance(retrieval_debug, dict)
+                and isinstance(retrieval_debug.get("queries"), dict)
+                else {
+                    "dense": retrieval_queries.dense_query,
+                    "lexical": (
+                        retrieval_queries.lexical_query
+                        if args.law_query_rewrite
+                        else retrieval_queries.dense_query
+                    ),
+                    "rerank": (
+                        retrieval_queries.rerank_query
+                        if args.law_query_rewrite
+                        else retrieval_queries.dense_query
+                    ),
+                    "circumstance": (
+                        retrieval_queries.circumstance_query
+                        if args.law_query_rewrite
+                        else ""
+                    ),
+                }
+            )
             law_block = _format_law_candidates(law_hits, args.max_law_chars)
 
             user_prompt = (
                 f"[案件事实]：{prompt_fact}\n"
                 f"[检索到的法条候选]：\n{law_block}\n"
-                "[任务说明]：请只在这些候选条文中进行选择，不要创造列表以外的新条文。"
+                "[任务说明]：请只在这些候选条文中选择一个最直接规定本案犯罪构成和罪名的主要法条，"
+                "不要创造列表以外的新条文。"
             )
 
             try:
@@ -511,7 +751,7 @@ def main() -> None:
                 print(f"[error] case_id={case_id} -> {e}")
                 content = ""
 
-            prediction = _parse_prediction(content)
+            prediction = _parse_prediction(content, args.max_output_articles)
             gold = {
                 "law_articles": _get_case_law_articles(case),
                 "imprisonment_months": _get_case_imprisonment(case),
@@ -521,16 +761,36 @@ def main() -> None:
             gold_set = _to_article_set(gold.get("law_articles", []))
             precision, recall, f1 = _precision_recall_f1(pred_set, gold_set)
             acc = 1.0 if pred_set == gold_set else 0.0
+            primary_hit = 1.0 if pred_set & gold_set else 0.0
             acc_scores.append(acc)
             ma_p_scores.append(precision)
             ma_r_scores.append(recall)
             ma_f_scores.append(f1)
+            primary_hit_scores.append(primary_hit)
+            if len(gold_set) == 1:
+                single_gold_acc_scores.append(acc)
+            elif len(gold_set) > 1:
+                multi_gold_recall_scores.append(recall)
 
             record = {
                 "case_id": case_id,
                 "fact": fact,
                 "prediction": prediction,
                 "gold": gold,
+                "retrieval": {
+                    "query_chars": len(retrieval_queries.dense_query),
+                    "law_query_rewrite": bool(args.law_query_rewrite),
+                    "queries": actual_queries,
+                    "candidates": [
+                        {"text": hit.text, "meta": hit.meta}
+                        for hit in law_hits
+                    ],
+                    "ranking_candidates": [
+                        {"text": hit.text, "meta": hit.meta}
+                        for hit in ranked_law_hits
+                    ],
+                    "debug": retrieval_debug,
+                },
             }
             jf.write(json.dumps(record, ensure_ascii=False) + "\n")
             print(f"[{idx}/{len(data)}] case_id={case_id}")
@@ -544,6 +804,9 @@ def main() -> None:
                 "Ma-P": _safe_mean(ma_p_scores),
                 "Ma-R": _safe_mean(ma_r_scores),
                 "Ma-F": _safe_mean(ma_f_scores),
+                "primary_hit_acc": _safe_mean(primary_hit_scores),
+                "single_gold_acc": _safe_mean(single_gold_acc_scores),
+                "multi_gold_primary_recall": _safe_mean(multi_gold_recall_scores),
             },
         }
         jf.write(json.dumps(summary, ensure_ascii=False) + "\n")
@@ -555,6 +818,12 @@ def main() -> None:
         print(f"Ma-P: {summary['metrics']['Ma-P']}")
         print(f"Ma-R: {summary['metrics']['Ma-R']}")
         print(f"Ma-F: {summary['metrics']['Ma-F']}")
+        print(f"primary_hit_acc: {summary['metrics']['primary_hit_acc']}")
+        print(f"single_gold_acc: {summary['metrics']['single_gold_acc']}")
+        print(
+            "multi_gold_primary_recall: "
+            f"{summary['metrics']['multi_gold_primary_recall']}"
+        )
     print(f"Saved jsonl to {output_path}")
 
 

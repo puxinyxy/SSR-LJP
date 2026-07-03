@@ -85,13 +85,13 @@ def _extract_article_id(text: str) -> int | None:
     if not text:
         return None
     norm = _fullwidth_to_halfwidth(text)
-    m = re.search(r"第\\s*(\\d{1,4})\\s*条", norm)
+    m = re.search(r"第\s*(\d{1,4})\s*条", norm)
     if m:
         try:
             return int(m.group(1))
         except ValueError:
             return None
-    m = re.search(rf"第\\s*([{_CN_NUM}]+)\\s*条", text)
+    m = re.search(rf"第\s*([{_CN_NUM}]+)\s*条", text)
     if m:
         try:
             val = _chinese_num_to_int(m.group(1))
@@ -101,20 +101,88 @@ def _extract_article_id(text: str) -> int | None:
     return None
 
 
+def extract_article_id(text: str) -> int | None:
+    return _extract_article_id(text)
+
+
+def extract_article_key(text: str) -> str | None:
+    if not text:
+        return None
+    norm = _fullwidth_to_halfwidth(text)
+    pattern = (
+        rf"^\s*第\s*(\d{{1,4}}|[{_CN_NUM}]+)\s*条"
+        rf"(?:\s*之\s*(\d{{1,3}}|[{_CN_NUM}]+))?"
+    )
+    match = re.search(pattern, norm)
+    if not match:
+        return None
+
+    def _part_to_int(value: str | None) -> int | None:
+        if not value:
+            return None
+        if value.isdigit():
+            return int(value)
+        parsed = _chinese_num_to_int(value)
+        return parsed if parsed > 0 else None
+
+    article_id = _part_to_int(match.group(1))
+    if article_id is None:
+        return None
+    suffix = _part_to_int(match.group(2))
+    return str(article_id) if suffix is None else f"{article_id}-{suffix}"
+
+
+def _group_law_document(text: str) -> List[str]:
+    articles: List[str] = []
+    current_lines: List[str] = []
+    found_header = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if extract_article_key(line) is not None:
+            found_header = True
+            if current_lines:
+                articles.append("\n".join(current_lines))
+            current_lines = [line]
+        elif current_lines:
+            current_lines.append(line)
+
+    if current_lines:
+        articles.append("\n".join(current_lines))
+    if found_header:
+        return articles
+
+    stripped = text.strip()
+    return [stripped] if stripped else []
+
+
+def load_grouped_law_texts(path: str | Path) -> List[str]:
+    law_path = Path(path)
+    if not law_path.exists():
+        raise FileNotFoundError(f"Law path not found: {law_path}")
+    files = [law_path] if law_path.is_file() else sorted(law_path.glob("*.txt"))
+    articles: List[str] = []
+    for file_path in files:
+        text = file_path.read_text(encoding="utf-8", errors="ignore")
+        articles.extend(_group_law_document(text))
+    return articles
+
+
 def load_law_articles(path: Path, max_chunks: int) -> List[TextItem]:
-    raw = path.read_text(encoding="utf-8", errors="ignore")
-    chunks = chunk_text(raw)
-    limited = chunks[:max_chunks]
+    limited = load_grouped_law_texts(path)[:max_chunks]
     return [
         TextItem(
-            text=c,
+            text=article,
             meta={
                 "source": "law_article",
-                "chunk_id": i,
-                "article_id": _extract_article_id(c),
+                "item_id": i,
+                "article_id": _extract_article_id(article),
+                "article_key": extract_article_key(article),
             },
         )
-        for i, c in enumerate(limited)
+        for i, article in enumerate(limited)
     ]
 
 
@@ -301,11 +369,132 @@ def build_index_cached(
     return VectorIndex(texts=list(items), vectors=vectors, embedder=embedder)
 
 
+def build_retrieval_index_cached(
+    embedder: OpenAICompatibleEmbedding,
+    items: Sequence[TextItem],
+    batch_size: int,
+    cache_dir: Path,
+    cache_prefix: str,
+    meta: dict,
+    retrieval_mode: str = "hybrid",
+    dense_top_k: int = 50,
+    bm25_top_k: int = 50,
+    keyword_top_k: int = 30,
+    join_top_k: int = 50,
+    rrf_k: float = 60.0,
+    dense_weight: float = 2.0,
+    bm25_weight: float = 0.7,
+    keyword_weight: float = 0.3,
+    fusion_mode: str = "rrf",
+    dense_score_weight: float = 0.65,
+    bm25_score_weight: float = 0.25,
+    keyword_score_weight: float = 0.10,
+    rerank_score_weight: float = 0.20,
+    dense_anchor: bool = False,
+    dense_margin_threshold: float = 0.02,
+    dense_override_threshold: float = 0.08,
+    legal_aware_rerank: bool = False,
+    lexical_include_numeric: bool = False,
+    query_max_chars: int = 2000,
+    use_rerank: bool = False,
+    rerank_top_k: int = 30,
+    rerank_model: str = "qwen3-rerank",
+    rerank_url: str = "https://dashscope.aliyuncs.com/compatible-api/v1/reranks",
+    rerank_api_key: str | None = None,
+    rerank_timeout: int = 60,
+    retrieval_cache_dir: Path | None = None,
+) -> Any:
+    dense_index = build_index_cached(
+        embedder,
+        items,
+        batch_size=batch_size,
+        cache_dir=cache_dir,
+        cache_prefix=cache_prefix,
+        meta=meta,
+    )
+    if retrieval_mode == "embedding":
+        return dense_index
+    if retrieval_mode != "hybrid":
+        raise ValueError(f"Unknown retrieval_mode: {retrieval_mode}")
+
+    from ljp_hybrid_retrieval import HybridIndex, HybridSearchConfig
+
+    lexical_cache_dir = retrieval_cache_dir or (cache_dir.parent / "retrieval_cache")
+    hybrid_meta = dict(meta)
+    hybrid_meta.update(
+        {
+            "retrieval_mode": retrieval_mode,
+            "dense_top_k": dense_top_k,
+            "bm25_top_k": bm25_top_k,
+            "keyword_top_k": keyword_top_k,
+            "join_top_k": join_top_k,
+            "rrf_k": rrf_k,
+            "dense_weight": dense_weight,
+            "bm25_weight": bm25_weight,
+            "keyword_weight": keyword_weight,
+            "fusion_mode": fusion_mode,
+            "dense_score_weight": dense_score_weight,
+            "bm25_score_weight": bm25_score_weight,
+            "keyword_score_weight": keyword_score_weight,
+            "rerank_score_weight": rerank_score_weight,
+            "dense_anchor": dense_anchor,
+            "dense_margin_threshold": dense_margin_threshold,
+            "dense_override_threshold": dense_override_threshold,
+            "legal_aware_rerank": legal_aware_rerank,
+            "lexical_include_numeric": lexical_include_numeric,
+            "query_max_chars": query_max_chars,
+            "use_rerank": use_rerank,
+            "rerank_top_k": rerank_top_k,
+            "rerank_model": rerank_model,
+            "rerank_url": rerank_url,
+        }
+    )
+    return HybridIndex(
+        dense_index.texts,
+        dense_index.vectors,
+        dense_index.embedder,
+        config=HybridSearchConfig(
+            dense_top_k=dense_top_k,
+            bm25_top_k=bm25_top_k,
+            keyword_top_k=keyword_top_k,
+            join_top_k=join_top_k,
+            rrf_k=rrf_k,
+            dense_weight=dense_weight,
+            bm25_weight=bm25_weight,
+            keyword_weight=keyword_weight,
+            fusion_mode=fusion_mode,
+            dense_score_weight=dense_score_weight,
+            bm25_score_weight=bm25_score_weight,
+            keyword_score_weight=keyword_score_weight,
+            rerank_score_weight=rerank_score_weight,
+            dense_anchor=dense_anchor,
+            dense_margin_threshold=dense_margin_threshold,
+            dense_override_threshold=dense_override_threshold,
+            legal_aware_rerank=legal_aware_rerank,
+            lexical_include_numeric=lexical_include_numeric,
+            query_max_chars=query_max_chars,
+            use_rerank=use_rerank,
+            rerank_top_k=rerank_top_k,
+            rerank_model=rerank_model,
+            rerank_url=rerank_url,
+            rerank_api_key=rerank_api_key,
+            rerank_timeout=rerank_timeout,
+        ),
+        cache_dir=lexical_cache_dir,
+        cache_prefix=f"{cache_prefix}_hybrid",
+        cache_meta=hybrid_meta,
+    )
+
+
 def search_index(
-    index: VectorIndex,
-    query: str,
+    index: Any,
+    query: Any,
     top_k: int = 3,
 ) -> List[TextItem]:
+    search_method = getattr(index, "search", None)
+    if callable(search_method):
+        return list(search_method(query, top_k))
+
     q_vec = batch_embed(index.embedder, [query])[0]
     scored = [
         (cosine_sim(q_vec, vec), item) for vec, item in zip(index.vectors, index.texts)

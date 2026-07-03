@@ -18,3 +18,16 @@ baseline_output/
 embedding_output/
 
 data/
+
+# Python/test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local experiment outputs and logs
+output_*
+*.stdout.log
+*.stderr.log
+
+# Local manuscript backups
+overleaf_ipm_26_backup/

@@ -20,6 +20,20 @@ from typing import Dict, Iterable, Optional, Set
 from openpyxl import Workbook
 
 from ljp_agents import make_llm, make_agent  # noqa: F401 (kept for parity with ljp_eval imports)
+from ljp_config import (
+    BM25_TOP_K,
+    BM25_WEIGHT,
+    DENSE_TOP_K,
+    DENSE_WEIGHT,
+    JOIN_TOP_K,
+    KEYWORD_TOP_K,
+    KEYWORD_WEIGHT,
+    RERANK_TOP_K,
+    RETRIEVAL_MODE,
+    RETRIEVAL_QUERY_MAX_CHARS,
+    RRF_K,
+    USE_RERANK,
+)
 from ljp_eval import (
     _normalize_acc,
     _parse_judgment_json,
@@ -144,6 +158,29 @@ def main():
     parser.add_argument("--offset", type=int, default=0, help="Start from this index")
     parser.add_argument("--top-k", type=int, default=None, help="Override top-k for retrieval")
     parser.add_argument(
+        "--retrieval-mode",
+        choices=("hybrid", "embedding"),
+        default=RETRIEVAL_MODE,
+        help="Retrieval mode. hybrid uses dense+BM25+keyword RRF.",
+    )
+    parser.add_argument("--dense-top-k", type=int, default=DENSE_TOP_K)
+    parser.add_argument("--bm25-top-k", type=int, default=BM25_TOP_K)
+    parser.add_argument("--keyword-top-k", type=int, default=KEYWORD_TOP_K)
+    parser.add_argument("--join-top-k", type=int, default=JOIN_TOP_K)
+    parser.add_argument("--rrf-k", type=float, default=RRF_K)
+    parser.add_argument("--dense-weight", type=float, default=DENSE_WEIGHT)
+    parser.add_argument("--bm25-weight", type=float, default=BM25_WEIGHT)
+    parser.add_argument("--keyword-weight", type=float, default=KEYWORD_WEIGHT)
+    parser.add_argument(
+        "--retrieval-query-max-chars",
+        type=int,
+        default=RETRIEVAL_QUERY_MAX_CHARS,
+    )
+    parser.add_argument("--use-rerank", dest="use_rerank", action="store_true")
+    parser.add_argument("--no-rerank", dest="use_rerank", action="store_false")
+    parser.set_defaults(use_rerank=USE_RERANK)
+    parser.add_argument("--rerank-top-k", type=int, default=RERANK_TOP_K)
+    parser.add_argument(
         "--dataset-path",
         type=str,
         # default="data/testset/cail_sampled.json",
@@ -169,6 +206,18 @@ def main():
     sys.argv = _argv_backup
     if args.top_k is not None:
         pipe_args.top_k = args.top_k
+    pipe_args.retrieval_mode = args.retrieval_mode
+    pipe_args.dense_top_k = args.dense_top_k
+    pipe_args.bm25_top_k = args.bm25_top_k
+    pipe_args.keyword_top_k = args.keyword_top_k
+    pipe_args.join_top_k = args.join_top_k
+    pipe_args.rrf_k = args.rrf_k
+    pipe_args.dense_weight = args.dense_weight
+    pipe_args.bm25_weight = args.bm25_weight
+    pipe_args.keyword_weight = args.keyword_weight
+    pipe_args.retrieval_query_max_chars = args.retrieval_query_max_chars
+    pipe_args.use_rerank = args.use_rerank
+    pipe_args.rerank_top_k = args.rerank_top_k
     # Use CAIL-specific candidates file; allow override via CLI
     pipe_args.candidates_path = args.candidates_path or "data/candidates/precedents_cail.json"
 

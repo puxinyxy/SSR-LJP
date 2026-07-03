@@ -22,15 +22,36 @@ if str(REPO_ROOT) not in sys.path:
 from camel.embeddings import OpenAICompatibleEmbedding
 
 from ljp_config import (
+    BM25_TOP_K,
+    BM25_WEIGHT,
+    DENSE_TOP_K,
+    DENSE_WEIGHT,
     EMBEDDING_API_KEY,
     EMBEDDING_BASE_URL,
     EMBEDDING_MODEL,
+    JOIN_TOP_K,
+    KEYWORD_TOP_K,
+    KEYWORD_WEIGHT,
     LLM_API_KEY,
     LLM_BASE_URL,
     LLM_MODEL,
+    RERANK_TOP_K,
+    RERANK_MODEL,
+    RERANK_TIMEOUT,
+    RERANK_URL,
+    RETRIEVAL_MODE,
+    RETRIEVAL_QUERY_MAX_CHARS,
+    RRF_K,
     TOP_K,
+    USE_RERANK,
 )
-from simple_vector_index import SimpleVectorIndex
+from ljp_hybrid_retrieval import prepare_retrieval_query
+from ljp_tools import (
+    TextItem,
+    build_retrieval_index_cached,
+    load_grouped_law_texts,
+    search_index,
+)
 
 
 SYSTEM_PROMPT = (
@@ -76,17 +97,8 @@ def load_dataset(path: str | Path) -> List[dict]:
 
 
 def load_law_articles(law_dir: str | Path) -> List[str]:
-    """Load law articles from *.txt files (one article per file)."""
-    law_path = Path(law_dir)
-    if not law_path.exists():
-        raise FileNotFoundError(f"Law dir not found: {law_path}")
-    files = sorted(law_path.glob("*.txt"))
-    articles: List[str] = []
-    for fp in files:
-        text = fp.read_text(encoding="utf-8", errors="ignore").strip()
-        if text:
-            articles.append(text)
-    return articles
+    """Load complete law articles from a file or directory."""
+    return load_grouped_law_texts(law_dir)
 
 
 def build_embedder(embedding_model: str) -> OpenAICompatibleEmbedding:
@@ -106,7 +118,7 @@ def _format_join(value: Any) -> str:
     return str(value).strip()
 
 
-def load_precedents(path: str | Path) -> List[str]:
+def load_precedents(path: str | Path) -> List[TextItem]:
     """
     Load precedent cases and format as concatenated strings for retrieval.
 
@@ -114,7 +126,7 @@ def load_precedents(path: str | Path) -> List[str]:
     【事实】{fact} 【裁判结论】罪名：{accusations}；适用法条：{law_articles}；有期徒刑：{imprisonment_months}个月
     """
     data = load_dataset(path)
-    results: List[str] = []
+    results: List[TextItem] = []
     for obj in data:
         if not isinstance(obj, dict):
             continue
@@ -122,17 +134,18 @@ def load_precedents(path: str | Path) -> List[str]:
         accusations = obj.get("accusations")
         law_articles = obj.get("law_articles")
         imprisonment = obj.get("imprisonment_months")
+        meta = obj.get("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
 
         if accusations is None:
-            meta = obj.get("meta", {})
             accusations = meta.get("accusation")
         if law_articles is None:
-            meta = obj.get("meta", {})
             law_articles = meta.get("relevant_articles")
         if imprisonment is None:
-            meta = obj.get("meta", {})
             term = meta.get("term_of_imprisonment", {})
-            imprisonment = term.get("imprisonment")
+            if isinstance(term, dict):
+                imprisonment = term.get("imprisonment")
 
         acc_text = _format_join(accusations) or "未知"
         law_text = _format_join(law_articles) or "未知"
@@ -144,8 +157,25 @@ def load_precedents(path: str | Path) -> List[str]:
         fact_text = fact if isinstance(fact, str) else str(fact)
         if not fact_text.strip():
             continue
-        results.append(
+        precedent_text = (
             f"【事实】{fact_text} 【裁判结论】罪名：{acc_text}；适用法条：{law_text}；有期徒刑：{imp_text}个月"
+        )
+        term = meta.get("term_of_imprisonment", {})
+        if not isinstance(term, dict):
+            term = {}
+        if imprisonment is not None and "imprisonment" not in term:
+            term = {**term, "imprisonment": imprisonment}
+        results.append(
+            TextItem(
+                text=precedent_text,
+                meta={
+                    "case_id": obj.get("caseID", obj.get("case_id")),
+                    "accusation": accusations,
+                    "relevant_articles": law_articles,
+                    "term_of_imprisonment": term,
+                    "punish_of_money": meta.get("punish_of_money", obj.get("punish_of_money", 0)),
+                },
+            )
         )
     return results
 
@@ -299,16 +329,18 @@ CN_NUM = "\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u53
 
 def _extract_article_numbers(text: str) -> set[int]:
     text_hw = _fullwidth_to_halfwidth(text)
-    nums = {int(n) for n in re.findall(r"\d{1,4}", text_hw)}
-
-    pattern = rf"[\u7b2c]?([{CN_NUM}]+)[\u6761\u7bc7]?"
-    for m in re.findall(pattern, text):
+    nums: set[int] = set()
+    pattern = re.compile(rf"\u7b2c\s*(\d{{1,4}}|[{CN_NUM}]+)\s*\u6761")
+    for match in pattern.finditer(text_hw):
+        raw = match.group(1)
         try:
-            val = _chinese_num_to_int(m)
+            val = int(raw) if raw.isdigit() else _chinese_num_to_int(raw)
             if val:
                 nums.add(val)
         except Exception:
             continue
+    if not nums and re.fullmatch(r"\s*\d{1,4}\s*", text_hw):
+        nums.add(int(text_hw.strip()))
     return nums
 
 
@@ -329,6 +361,11 @@ def _to_article_set(values: Sequence[Any]) -> set[int]:
             continue
         nums.update(_extract_article_numbers(text))
     return nums
+
+
+def _first_article_id(text: str) -> Optional[int]:
+    article_ids = _extract_article_numbers(text)
+    return min(article_ids) if article_ids else None
 
 
 def _precision_recall_f1(pred_set: set[int], gold_set: set[int]) -> tuple[float, float, float]:
@@ -407,27 +444,62 @@ def _parse_prediction(text: str) -> Dict[str, Any]:
     return pred
 
 
-def _format_law_candidates(hits: Sequence[str], max_chars: int) -> str:
+def _hit_text(hit: Any) -> str:
+    if isinstance(hit, TextItem):
+        return hit.text
+    if isinstance(hit, dict):
+        return str(hit.get("text", ""))
+    return str(hit)
+
+
+def _hit_meta(hit: Any) -> dict:
+    if isinstance(hit, TextItem):
+        return hit.meta if isinstance(hit.meta, dict) else {}
+    if isinstance(hit, dict):
+        meta = hit.get("meta", {})
+        return meta if isinstance(meta, dict) else {}
+    return {}
+
+
+def _serialize_hits(hits: Sequence[Any]) -> List[dict]:
+    serialized: List[dict] = []
+    for hit in hits:
+        if isinstance(hit, TextItem):
+            serialized.append({"text": hit.text, "meta": hit.meta})
+        elif isinstance(hit, dict):
+            meta = hit.get("meta", {})
+            serialized.append(
+                {
+                    "text": str(hit.get("text", "")),
+                    "meta": meta if isinstance(meta, dict) else {},
+                }
+            )
+        else:
+            serialized.append({"text": str(hit), "meta": {}})
+    return serialized
+
+
+def _format_law_candidates(hits: Sequence[Any], max_chars: int) -> str:
     if not hits:
         return "无"
     lines = []
     for i, hit in enumerate(hits, 1):
-        snippet = hit.strip().replace("\n", " ")
+        snippet = _hit_text(hit).strip().replace("\n", " ")
         if max_chars > 0:
             snippet = snippet[:max_chars]
         lines.append(f"候选{i}：{snippet}")
     return "\n".join(lines)
 
 
-def _format_precedent_candidates(hits: Sequence[str], max_chars: int) -> str:
+def _format_precedent_candidates(hits: Sequence[Any], max_chars: int) -> str:
     if not hits:
         return "无"
     lines = []
     for i, hit in enumerate(hits, 1):
-        fact = hit.strip().replace("\n", " ")
+        text = _hit_text(hit).strip().replace("\n", " ")
         if max_chars > 0:
-            fact = fact[:max_chars]
-        lines.append(f"案例{i}：{fact}")
+            text = text[:max_chars]
+        lines.append(f"案例{i}：{text}")
     return "\n".join(lines)
 
 
@@ -485,6 +557,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--topk_law", type=int, default=TOP_K)
     parser.add_argument("--topk_case", type=int, default=TOP_K)
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=("hybrid", "embedding"),
+        default=RETRIEVAL_MODE,
+        help="Retrieval mode. hybrid uses dense+BM25+keyword RRF.",
+    )
+    parser.add_argument("--dense-top-k", type=int, default=DENSE_TOP_K)
+    parser.add_argument("--bm25-top-k", type=int, default=BM25_TOP_K)
+    parser.add_argument("--keyword-top-k", type=int, default=KEYWORD_TOP_K)
+    parser.add_argument("--join-top-k", type=int, default=JOIN_TOP_K)
+    parser.add_argument("--rrf-k", type=float, default=RRF_K)
+    parser.add_argument("--dense-weight", type=float, default=DENSE_WEIGHT)
+    parser.add_argument("--bm25-weight", type=float, default=BM25_WEIGHT)
+    parser.add_argument("--keyword-weight", type=float, default=KEYWORD_WEIGHT)
+    parser.add_argument(
+        "--retrieval-query-max-chars",
+        type=int,
+        default=RETRIEVAL_QUERY_MAX_CHARS,
+    )
+    parser.add_argument("--use-rerank", dest="use_rerank", action="store_true")
+    parser.add_argument("--no-rerank", dest="use_rerank", action="store_false")
+    parser.set_defaults(use_rerank=USE_RERANK)
+    parser.add_argument("--rerank-top-k", type=int, default=RERANK_TOP_K)
+    parser.add_argument(
+        "--retrieval-record-top-k",
+        type=int,
+        default=RERANK_TOP_K,
+        help="Ranking depth saved for retrieval metrics; LLM still receives --topk-law/--topk-case.",
+    )
     parser.add_argument("--max-law-chars", type=int, default=400)
     parser.add_argument("--max-prec-chars", type=int, default=400)
     parser.add_argument("--max-fact-chars", type=int, default=2000)
@@ -499,6 +600,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.retrieval_record_top_k < max(args.topk_law, args.topk_case):
+        raise SystemExit("--retrieval-record-top-k must cover --topk-law and --topk-case")
     logger, run_dir, run_id = setup_run_logger(
         run_name="eval_llm_rag_penalty",
         args=vars(args),
@@ -513,20 +616,102 @@ def main() -> None:
     law_texts = load_law_articles(args.law_dir)
     if not law_texts:
         raise ValueError(f"No law articles found in {args.law_dir}")
-    precedent_texts = load_precedents(args.precedent_file)
-    if not precedent_texts:
+    law_items = [
+        TextItem(
+            text=text,
+            meta={
+                "source": "law_article",
+                "item_id": i,
+                "article_id": _first_article_id(text),
+            },
+        )
+        for i, text in enumerate(law_texts)
+    ]
+    precedent_items = load_precedents(args.precedent_file)
+    if not precedent_items:
         raise ValueError(f"No precedents found in {args.precedent_file}")
 
     embedder = build_embedder(args.embedding_model)
-    law_index = SimpleVectorIndex(embedder, law_texts)
-    case_index = SimpleVectorIndex(embedder, precedent_texts)
+    embedding_cache_dir = Path("output/embedding_cache")
+    retrieval_cache_dir = Path("output/retrieval_cache")
+    law_path = Path(args.law_dir)
+    precedent_path = Path(args.precedent_file)
+    law_cache_meta = {
+        "source": str(law_path),
+        "source_mtime": law_path.stat().st_mtime if law_path.exists() else 0,
+        "source_size": law_path.stat().st_size if law_path.is_file() else 0,
+        "num_items": len(law_items),
+        "embedding_model": args.embedding_model,
+        "retrieval_mode": args.retrieval_mode,
+        "task": "penalty_law",
+    }
+    case_cache_meta = {
+        "source": str(precedent_path),
+        "source_mtime": precedent_path.stat().st_mtime if precedent_path.exists() else 0,
+        "source_size": precedent_path.stat().st_size if precedent_path.exists() else 0,
+        "num_items": len(precedent_items),
+        "embedding_model": args.embedding_model,
+        "retrieval_mode": args.retrieval_mode,
+        "task": "penalty_cases",
+    }
+    law_index = build_retrieval_index_cached(
+        embedder,
+        law_items,
+        batch_size=10,
+        cache_dir=embedding_cache_dir,
+        cache_prefix="penalty_law",
+        meta=law_cache_meta,
+        retrieval_mode=args.retrieval_mode,
+        dense_top_k=args.dense_top_k,
+        bm25_top_k=args.bm25_top_k,
+        keyword_top_k=args.keyword_top_k,
+        join_top_k=args.join_top_k,
+        rrf_k=args.rrf_k,
+        dense_weight=args.dense_weight,
+        bm25_weight=args.bm25_weight,
+        keyword_weight=args.keyword_weight,
+        query_max_chars=args.retrieval_query_max_chars,
+        use_rerank=args.use_rerank,
+        rerank_top_k=args.rerank_top_k,
+        rerank_model=RERANK_MODEL,
+        rerank_url=RERANK_URL,
+        rerank_api_key=EMBEDDING_API_KEY,
+        rerank_timeout=RERANK_TIMEOUT,
+        retrieval_cache_dir=retrieval_cache_dir,
+    )
+    case_index = build_retrieval_index_cached(
+        embedder,
+        precedent_items,
+        batch_size=10,
+        cache_dir=embedding_cache_dir,
+        cache_prefix="penalty_cases",
+        meta=case_cache_meta,
+        retrieval_mode=args.retrieval_mode,
+        dense_top_k=args.dense_top_k,
+        bm25_top_k=args.bm25_top_k,
+        keyword_top_k=args.keyword_top_k,
+        join_top_k=args.join_top_k,
+        rrf_k=args.rrf_k,
+        dense_weight=args.dense_weight,
+        bm25_weight=args.bm25_weight,
+        keyword_weight=args.keyword_weight,
+        query_max_chars=args.retrieval_query_max_chars,
+        use_rerank=args.use_rerank,
+        rerank_top_k=args.rerank_top_k,
+        rerank_model=RERANK_MODEL,
+        rerank_url=RERANK_URL,
+        rerank_api_key=EMBEDDING_API_KEY,
+        rerank_timeout=RERANK_TIMEOUT,
+        retrieval_cache_dir=retrieval_cache_dir,
+    )
     logger.info(
-        "config dataset_path=%s precedent_file=%s law_dir=%s topk_case=%s topk_law=%s",
+        "config dataset_path=%s precedent_file=%s law_dir=%s topk_case=%s topk_law=%s retrieval_mode=%s",
         args.dataset_path,
         args.precedent_file,
         args.law_dir,
         args.topk_case,
         args.topk_law,
+        args.retrieval_mode,
     )
 
     output_path = Path(args.output_path)
@@ -545,8 +730,24 @@ def main() -> None:
             prompt_fact = fact
             if args.max_fact_chars > 0:
                 prompt_fact = prompt_fact[: args.max_fact_chars]
-            law_hits = law_index.search(fact, args.topk_law)
-            prec_hits = case_index.search(fact, args.topk_case)
+            retrieval_query = prepare_retrieval_query(
+                fact,
+                args.retrieval_query_max_chars,
+            )
+            ranked_law_hits = search_index(
+                law_index,
+                retrieval_query,
+                args.retrieval_record_top_k,
+            )
+            law_hits = ranked_law_hits[: args.topk_law]
+            law_retrieval_debug = getattr(law_index, "last_search_debug", None)
+            ranked_prec_hits = search_index(
+                case_index,
+                retrieval_query,
+                args.retrieval_record_top_k,
+            )
+            prec_hits = ranked_prec_hits[: args.topk_case]
+            case_retrieval_debug = getattr(case_index, "last_search_debug", None)
             law_block = _format_law_candidates(law_hits, args.max_law_chars)
             prec_block = _format_precedent_candidates(prec_hits, args.max_prec_chars)
 
@@ -601,6 +802,15 @@ def main() -> None:
                 "fact": fact,
                 "prediction": prediction,
                 "gold": gold,
+                "retrieval": {
+                    "query_chars": len(retrieval_query),
+                    "law_candidates": _serialize_hits(law_hits),
+                    "ranking_law_candidates": _serialize_hits(ranked_law_hits),
+                    "precedent_candidates": _serialize_hits(prec_hits),
+                    "ranking_precedent_candidates": _serialize_hits(ranked_prec_hits),
+                    "law_debug": law_retrieval_debug,
+                    "precedent_debug": case_retrieval_debug,
+                },
             }
             jf.write(json.dumps(record, ensure_ascii=False) + "\n")
             print(f"[{idx}/{len(data)}] case_id={case_id}")
